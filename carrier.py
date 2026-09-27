@@ -652,10 +652,11 @@ def remove_imsi_links(original):
 
 def check_phone(info):
     model = MODELS.get(info['ProductType'])
-    require(model and str(info['HardwareModel']).upper() in model['boards'],
-            'Неизвестная модель или плата. Поддерживаются перечисленные в README iPhone 14–18 и Air.')
-    require(info['ProductVersion']=='27.0' and info['BuildVersion'] in ('24A435','24A437'),
-            'Эта сборка iOS не проверена. Поддерживаются iOS 27.0, 24A435 / 24A437.')
+    if (not model or str(info['HardwareModel']).upper() not in model['boards']
+            or info['ProductVersion'] != '27.0'
+            or info['BuildVersion'] not in ('24A435', '24A437')):
+        print('Предупреждение: модель, плата или версия iOS не проверена. '
+              'Скрипт МОЖЕТ не работать. Продолжаю без ограничения совместимости.', flush=True)
     require(info['ActivationState']=='Activated','iPhone не активирован.')
 
 
@@ -821,11 +822,13 @@ def check_trigger_hardware(path, hardware):
         boards = leaf.removeprefix('overrides_').removesuffix('.plist').upper().split('_')
         if board in boards:
             signature = name.rsplit('/',1)[0]+'/signatures/'+leaf
-            require(signature in tree, 'В триггере нет подписи для '+hardware)
-            return
-    raise RuntimeError('В триггере нет настроек для '+hardware+
-                       '. Нужен полный подписанный IPCC для этой платы; укажите --trigger. '
-                       'Скрипт не будет использовать триггер от другой платы.')
+            if signature in tree:
+                return True
+            break
+    print('Предупреждение: в IPCC нет настроек с подписью для платы '+hardware+
+          '. Пересканирование МОЖЕТ не работать; продолжаю.', flush=True)
+    return False
+
 
 
 async def execute(args,bundles,assets):
@@ -839,7 +842,7 @@ async def execute(args,bundles,assets):
         if args.restore:
             sims=[{'slot':r['Slot'],'plmn':str(r.get('MCC',''))+str(r.get('MNC','')),'bundle':None}
                   for r in rows if r.get('Slot') in ('kOne','kTwo')]
-        print(f"\n  {MODELS[info['ProductType']]['name']} · iOS {info['ProductVersion']} ({info['BuildVersion']})",flush=True)
+        print(f"\n  {MODELS.get(info['ProductType'], {}).get('name', info['ProductType'])} · iOS {info['ProductVersion']} ({info['BuildVersion']})",flush=True)
         for s in sims:
             label = {'kOne':'SIM 1', 'kTwo':'SIM 2'}[s['slot']]
             target='штатный профиль' if args.restore else 'Vodafone HU (по IMSI)'
@@ -943,7 +946,7 @@ def main():
         except Exception as e:framed({'ok':False,'error':str(e)});return 1
     print('Исследование, разработка и тесты — Vladimir B / vlw (vlwwwwww@gmail.com).',flush=True)
     parser=argparse.ArgumentParser(description='Vodafone_hu для всех SIM независимо от страны. '
-        'Без флагов: установить по IMSI на SIM, сообщённые iPhone. iPhone 14–18 и Air / iOS 27.0.',
+        'Без флагов: установить по IMSI на SIM, сообщённые iPhone. Без ограничений по модели iPhone и версии iOS; совместимость не гарантируется.',
         add_help=False)
     parser.add_argument('-h','--help',action='help',help='показать эту справку')
     group=parser.add_mutually_exclusive_group()
