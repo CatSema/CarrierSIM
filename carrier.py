@@ -1444,10 +1444,16 @@ def run_details(run):
         dlog = stage/'device.log'
         if dlog.exists():
             lines = dlog.read_text(encoding='utf-8', errors='replace').splitlines()
-            key = [l for l in lines if any(k in l.lower() for k in
-                   ('deny', 'error', 'fail', 'airlift', 'carrier bundles', 'not found', 'no such', 'reject', 'skip', 'invalid'))]
+            # Only AirTraffic, Books and sandbox problems; trustd/wifid/atc(Apps) noise is in device.log.
+            source = re.compile(r'\batc\((AirTraffic\w*|ATFoundation|Books|Foundation)\)|kernel\(Sandbox\)')
+            problem = re.compile(r'<Error>|<Fault>|\bdeny\(|Aborting|SyncFailed|ErrorCode|installOnly=1|'
+                                 r'could not|not found|no such file', re.I)
+            # Present in every successful run as well: not a cause.
+            benign = ('ATGetUsageForPath', 'Artwork file does not exist', 'ATStoreInfo with no',
+                      "Asset path isn't in one of the expected directories", 'Could not create sandbox extension')
+            key = [l for l in lines if source.search(l) and problem.search(l) and not any(b in l for b in benign)]
             rows.append(('  Журнал iPhone', f'{len(lines)} строк, важных {len(key)}'))
-            for l in key[-25:]:
+            for l in key[-12:]:
                 rows.append(('    iPhone', re.sub(r'^\w{3} +\d+ [\d:]+ \S+ ', '', l.strip())[:300]))
         err = stage/'host.stderr'
         if err.exists():
