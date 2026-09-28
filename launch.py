@@ -76,7 +76,8 @@ def main():
         print('\n' + '─' * 56, flush=True)
         try:
             if python is None: python = python_environment()
-            result = subprocess.run([str(python), '-u', str(ROOT / 'carrier.py'), *args], cwd=ROOT)
+            result = subprocess.run([str(python), '-u', str(ROOT / 'carrier.py'), *args], cwd=ROOT,
+                                    env={**os.environ, 'CARRIERSIM_MENU': '1'})
             if result.returncode == 2:
                 print('\nВыбор профиля не подтверждён. Подробности — в журнале операции.')
             elif result.returncode:

@@ -29,13 +29,19 @@ BOOK_FILES = ('Books/Books.plist', 'Books/Sync/Books.plist', 'Books/Sync/Upload.
               'Books/Sync/Database/OutstandingAssets_4.sqlite',
               'Books/Sync/Database/OutstandingAssets_4.sqlite-shm',
               'Books/Sync/Database/OutstandingAssets_4.sqlite-wal')
-BOOK_DIRS = ('Books', 'Books/Sync', 'Books/Sync/Database')
+BOOK_DIRS = ('Books', 'Books/Managed', 'Books/Sync', 'Books/Sync/Database')
 
 
 
 def require(ok, message):
     if not ok:
         raise RuntimeError(message)
+
+def recover_hint():
+    # The launcher menu runs this script with CARRIERSIM_MENU=1; its users never type flags.
+    if os.environ.get('CARRIERSIM_MENU'):
+        return 'выберите в меню пункт 5 «Восстановить после сбоя»'
+    return 'запустите скрипт с флагом --recover'
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
@@ -225,7 +231,10 @@ async def restore_books(afc, tree, existed):
         if not was_present and await exists(afc, path) and not await afc.listdir(path):
             await afc.rm_single(path)
     after = await remote_tree(afc, 'Books') if await exists(afc, 'Books') else {}
-    require(after == tree, 'Books state differs; backups retained, inspect before retry')
+    diff = sorted(n for n in tree.keys() | after.keys() if tree.get(n) != after.get(n))
+    require(not diff, 'Не удалось вернуть служебную папку Books на iPhone в исходное состояние. '
+            'Копии сохранены в папке runs — не удаляйте её. Сообщите автору текст этой ошибки. '
+            'Отличаются: ' + ', '.join(diff[:10]))
 
 async def transfer(device, run, payload=None, expected=None, recovery=False):
     from pymobiledevice3.services.afc import AfcService
@@ -287,13 +296,13 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
                     phase('recovery-final-authorized')
                     return
                 require(node and node['st_ifmt'] == 'S_IFDIR',
-                        'No exported catalog. Do not retry blindly; inspect journal and original paths.')
+                        'iPhone не отдал текущие настройки оператора. Не повторяйте установку: '+recover_hint()+'.')
                 phase('original-exported')
                 snapshot = await remote_tree(afc, exported)
                 write_tree_zip(run / 'original.zip', snapshot)
                 phase('backup-saved', original_hash=tree_hash(snapshot))
                 if expected is not None:
-                    require(snapshot == expected, 'Carrier catalog changed since snapshot; recover this run')
+                    require(snapshot == expected, 'Настройки оператора на iPhone изменились во время операции. Запись отменена: '+recover_hint()+'.')
                 require(await remote_tree(afc, exported) == snapshot, 'Export changed after backup')
                 phase('final-authorized')
             phase('host-started')
@@ -595,7 +604,7 @@ async def host_session(udid, assets, callback, run):
                     else: result = row
                 code = await proc.wait()
         require(code == 0 and paused and result and result.get('ok'),
-                'Сбой AirTraffic; сохраните каталог операции для --recover')
+                'Сбой AirTraffic. Не удаляйте папку runs и '+recover_hint()+'.')
     finally:
         if proc.returncode is None:
             proc.kill(); await proc.wait()
@@ -716,7 +725,7 @@ async def execute_with_retry(args,bundles,assets):
             failed=pending(args.runs,args.udid)
             if failed:
                 print('Связь прервалась. Сначала восстанавливаю незавершённый этап…',flush=True)
-                require(len(failed)==1,'Несколько незавершённых этапов: требуется --recover.')
+                require(len(failed)==1,'Найдено несколько незавершённых операций; автоматически их не восстановить. Сообщите автору.')
                 device=await ready_device(args.udid,args.wait_seconds)
                 recovery=args.runs/(datetime.now().strftime('%Y%m%d-%H%M%S-')+'auto-recovery-'+uuid.uuid4().hex[:6])
                 recovery.mkdir(mode=0o700)
@@ -788,6 +797,12 @@ async def recover_stage(device, failed, run):
     require(tree_hash(books)==state['hash'],'Копия Books повреждена.')
     desired = None
     async with AfcService(device) as afc:
+        if record.get('complete'):
+            # The carrier stage finished; only the Books cleanup failed. Never roll back the catalog.
+            await restore_books(afc,books,state['existed'])
+            record['recovered_by']=str(run);record['books_restored']=True
+            save_json(failed/'journal.json',record)
+            return
         if await exists(afc,remote):
             desired = await remote_tree(afc,remote)
             if record.get('original_hash'):
@@ -855,11 +870,12 @@ async def execute(args,bundles,assets):
         unresolved=pending(args.runs,udid)
         if args.recover == Path('AUTO'):
             if not unresolved:
-                print('Незавершённых операций для этого iPhone нет.');return 0
-            require(len(unresolved)==1,'Найдено несколько незавершённых этапов; требуется разбор журналов.')
+                print('Незавершённых операций для этого iPhone нет, восстанавливать нечего.');return 0
+            require(len(unresolved)==1,'Найдено несколько незавершённых операций; автоматически их не восстановить. Сообщите автору.')
             args.recover=unresolved[0]
         require(not unresolved or (args.recover and all(p.resolve()==args.recover.resolve() for p in unresolved)),
-                'Сначала выполните --recover для этапа: '+str(unresolved[0] if unresolved else ''))
+                'Прошлая операция на этом iPhone не завершилась. Сначала '+recover_hint()+
+                ', затем повторите действие. Этап: '+str(unresolved[0] if unresolved else ''))
         run=args.runs/(datetime.now().strftime('%Y%m%d-%H%M%S-')+uuid.uuid4().hex[:6])
         run.mkdir(mode=0o700)
         print('Копии и журнал:',run,flush=True)
@@ -932,7 +948,10 @@ async def execute(args,bundles,assets):
         if run:
             save_json(run/'error.json',{'error':type(error).__name__+': '+str(error)})
             print('Операция остановлена. Журнал:',run,file=sys.stderr)
-            for p in pending(args.runs,udid):print('Для восстановления: --recover "'+str(p)+'"',file=sys.stderr)
+            unresolved=pending(args.runs,udid)
+            if unresolved and not args.recover:
+                print('Чтобы вернуть iPhone в исходное состояние, '+recover_hint()+'.',file=sys.stderr)
+            for p in unresolved:print('Незавершённый этап: "'+str(p)+'"',file=sys.stderr)
         raise
     finally:await device.close()
 
@@ -990,6 +1009,6 @@ def main():
 if __name__=='__main__':
     try:sys.exit(main())
     except KeyboardInterrupt:
-        print('Прервано. Сохраните runs; используйте --recover для незавершённого этапа.',file=sys.stderr);sys.exit(130)
+        print('Прервано. Не удаляйте папку runs. Если запись уже началась, '+recover_hint()+'.',file=sys.stderr);sys.exit(130)
     except Exception as e:
         print('Ошибка:',str(e),file=sys.stderr);sys.exit(1)
