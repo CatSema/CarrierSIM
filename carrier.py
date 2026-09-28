@@ -348,10 +348,18 @@ async def restore_books(afc, tree, existed):
         if not was_present and await exists(afc, path) and not await afc.listdir(path):
             await afc.rm_single(path)
     after = await remote_tree(afc, 'Books') if await exists(afc, 'Books') else {}
-    diff = sorted(n for n in tree.keys() | after.keys() if tree.get(n) != after.get(n))
-    require(not diff, 'Не удалось вернуть служебную папку Books на iPhone в исходное состояние. '
+    # Only files and folders this function restores must match the backup. The rest of Books
+    # (Purchases, MetadataStore, the user's books) may be rewritten by iOS during the session;
+    # it cannot be put back from here, so a difference there is reported, not treated as failure.
+    files = {p.removeprefix('Books/') for p in BOOK_FILES} | {'Managed/.Managed.plist.lock', 'Sync/.bookSync.lock'}
+    folders = {p.removeprefix('Books/') for p in BOOK_DIRS[1:]}
+    diff = sorted([n for n in files if tree.get(n) != after.get(n)] +
+                  [n for n in folders if (n in tree) != (n in after)])
+    require(not diff, 'Не удалось вернуть служебные файлы Books на iPhone в исходное состояние. '
             'Копии сохранены в папке runs — не удаляйте её. Сообщите автору текст этой ошибки. '
             'Отличаются: ' + ', '.join(diff[:10]))
+    return sorted(n for n in tree.keys() | after.keys()
+                  if n not in files and n not in folders and tree.get(n) != after.get(n))
 
 
 # Device-side view of an AirTraffic session: atc decides which assets enter the manifest.
@@ -490,8 +498,9 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
         finally:
             if mutated:
                 try:
-                    await restore_books(afc, books, books_existed)
+                    other = await restore_books(afc, books, books_existed)
                     journal['books_restored'] = True
+                    if other: journal['books_other_changes'] = other[:50]
                 except Exception as e:
                     journal['books_restored'] = False
                     journal['books_restore_error'] = str(e)
@@ -1038,7 +1047,7 @@ async def recover_stage(device, failed, run, tag=''):
     async with AfcService(device) as afc:
         if record.get('complete'):
             # The carrier stage finished; only the Books cleanup failed. Never roll back the catalog.
-            await restore_books(afc,books,state['existed'])
+            if (other:=await restore_books(afc,books,state['existed'])):record['books_other_changes']=other[:50]
             record['recovered_by']=str(run);record['books_restored']=True
             save_json(failed/'journal.json',record)
             return
@@ -1055,7 +1064,7 @@ async def recover_stage(device, failed, run, tag=''):
             # files in /var/mobile/Media changed, so undo those without another AirTraffic session.
             require(record.get('phase') in ('created','staging','host-started','export-check'),
                     'Нет проверенной копии. Сохраните runs; восстановление остановлено.')
-        await restore_books(afc,books,state['existed'])
+        if (other:=await restore_books(afc,books,state['existed'])):record['books_other_changes']=other[:50]
     if desired is not None:
         write_tree_zip(run/f'recovery-original{tag}.zip',desired)
         await transfer(device,run/f'recover{tag}',payload=desired,recovery=True)
@@ -1193,9 +1202,11 @@ async def execute(args,assets):
                   'выбор нужного пакета не подтверждён; см. журнал'),flush=True)
         if args.restore:print('Все ссылки по IMSI удалены. Обычные ссылки операторов сохранены.',flush=True)
         installing=not (args.restore or args.restore_backup or args.recover)
-        missing=sorted({s['expected'] for s in result if s['expected']!=BUNDLE
-                        and (s['selected'] or '').lower()!=s['expected'].lower()})
-        if installing and missing:
+        missing=[]
+        if installing:
+            missing=sorted({s['expected'] for s in result if s['expected'] and s['expected']!=BUNDLE
+                            and (s['selected'] or '').lower()!=s['expected'].lower()})
+        if missing:
             # AFC cannot read /System, so a missing bundle only shows up in the rescan log.
             # Never leave links to it: put back the catalog saved before this write.
             print('iOS не выбрала '+', '.join(missing)+': такого пакета, видимо, нет в этой '
@@ -1323,6 +1334,7 @@ def run_details(run):
         except Exception: continue
         line = f"фаза {j.get('phase')}, завершён {bool(j.get('complete'))}, Books восстановлен {j.get('books_restored')}"
         if j.get('stale_books_removed'): line += f", удалены старые записи: {j['stale_books_removed']}"
+        if j.get('books_other_changes'): line += f", iOS изменила в Books: {', '.join(j['books_other_changes'][:8])}"
         if j.get('media_leftovers'):
             old = sorted({n.rsplit('-', 1)[-1] for n in j['media_leftovers']} - {str(j.get('source', '')).rsplit('-', 1)[-1]})
             rows.append(('  Остатки прошлых запусков в Media', ', '.join(j['media_leftovers'][:12]) + (f' (запусков: {len(old)})' if old else '')))
