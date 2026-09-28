@@ -563,8 +563,15 @@ def native_host(udid, assets, directories):
         host.call('ATHostConnectionSendMetadataSyncFinished', connection, {'Book':1}, {})
         manifest = until('AssetManifest', 20)
         require(isinstance(manifest,dict), 'Неверный манифест AirTraffic')
-        found = {r.get('AssetID') for r in manifest.get('Book',[]) if isinstance(r,dict) and r.get('IsDownload')}
-        require(all(a in found for a,_ in assets), 'AirTraffic не подтвердил нужные объекты')
+        books = [r for r in manifest.get('Book',[]) if isinstance(r,dict)]
+        found = {r.get('AssetID') for r in books if r.get('IsDownload')}
+        missing = [a for a,_ in assets if a not in found]
+        if missing:
+            # Keep what the phone actually answered: host.jsonl in the run folder.
+            framed({'event':'manifest','dataclasses':sorted(map(str,manifest)),'expected':[a for a,_ in assets],
+                    'book':[{k:str(v) for k,v in r.items()} for r in books[:50]]})
+            raise RuntimeError(f'AirTraffic не подтвердил нужные объекты: iPhone вернул {len(books)} '
+                               f'объект(ов) Book, не хватает {len(missing)} из {len(assets)}')
         for i,(identifier,destination) in enumerate(assets):
             if i == 2:
                 framed({'event':'before-final-asset'})
@@ -742,8 +749,9 @@ def transient_error(error):
                          errors.ConnectionFailedError,errors.InvalidConnectionError)):
         return True
     if isinstance(error,OSError) and error.errno in (32,54,60,104,110):return True
+    # The phone answering without our assets is deterministic: retrying only repeats it.
     return isinstance(error,RuntimeError) and any(t in str(error) for t in
-        ('Сбой AirTraffic','Final source not consumed'))
+        ('Сбой AirTraffic','Final source not consumed')) and 'не подтвердил нужные объекты' not in str(error)
 
 
 async def execute_with_retry(args,assets):
@@ -753,7 +761,7 @@ async def execute_with_retry(args,assets):
         print(f'Попытка {attempt} из {args.attempts}',flush=True)
         try:return await execute(args,assets)
         except Exception as error:
-            if not transient_error(error):raise
+            # Roll back after any failure; retry only when a new attempt can change the outcome.
             failed=pending(args.runs,args.udid)
             if failed:
                 print('Сбой во время записи. Сначала возвращаю iPhone в исходное состояние…',flush=True)
@@ -768,8 +776,8 @@ async def execute_with_retry(args,assets):
                     print('Не удаляйте папку runs и '+recover_hint()+'.',flush=True)
                     raise
                 finally:await device.close()
-            if attempt==args.attempts:raise
-            print('Временный сбой соединения. Повторю после восстановления связи…',flush=True)
+            if attempt==args.attempts or not transient_error(error):raise
+            print('Повторяю попытку…',flush=True)
             await asyncio.sleep(2)
 
 
@@ -892,7 +900,7 @@ async def execute(args,assets):
     device=await ready_device(udid,args.wait_seconds)
     run=None
     try:
-        info=await device_info(device); check_phone(info)
+        info=await device_info(device); DIAG['info']=info; check_phone(info)
         rows=await device.get_value(key='CarrierBundleInfoArray') or []
         slots=SLOT_CHOICES[args.sims]
         sims=select_sims(rows,args.bundle,slots) if not (args.restore or args.restore_backup or args.recover) else []
@@ -918,7 +926,7 @@ async def execute(args,assets):
                 'Прошлая операция на этом iPhone не завершилась. Сначала '+recover_hint()+
                 ', затем повторите действие. Этап: '+str(unresolved[0] if unresolved else ''))
         run=args.runs/(datetime.now().strftime('%Y%m%d-%H%M%S-')+uuid.uuid4().hex[:6])
-        run.mkdir(mode=0o700)
+        run.mkdir(mode=0o700); DIAG['run']=run
         print('Копии и журнал:',run,flush=True)
         print('Идёт установка или восстановление, ожидайте… Не отключайте iPhone.',flush=True)
         save_json(run/'device.json',{**info,'udid_hash':digest(udid.encode())})
@@ -935,6 +943,7 @@ async def execute(args,assets):
             trigger=run/'custom-trigger.ipcc';trigger.write_bytes(args.trigger.read_bytes())
             check_trigger(trigger,plmns,args.bundle);check_trigger_hardware(trigger,info['HardwareModel'])
         require(trigger is not None,'Не найден независимый триггер для этих SIM.')
+        DIAG['trigger']=trigger.name
         if args.recover:
             if isinstance(args.recover,list):await recover_all(device,args.recover,run)
             else:await recover_stage(device,args.recover.resolve(),run)
@@ -1005,14 +1014,162 @@ async def execute(args,assets):
     except BaseException as error:
         if run:
             save_json(run/'error.json',{'error':type(error).__name__+': '+str(error)})
+            # execute_with_retry rolls back any unfinished stage and reports the outcome.
             print('Операция остановлена. Журнал:',run,file=sys.stderr)
-            unresolved=pending(args.runs,udid)
-            if unresolved and not args.recover and not transient_error(error):
-                print('Чтобы вернуть iPhone в исходное состояние, '+recover_hint()+'.',file=sys.stderr)
-            if not transient_error(error):
-                for p in unresolved:print('Незавершённый этап: "'+str(p)+'"',file=sys.stderr)
         raise
     finally:await device.close()
+
+# ---- Diagnostics printed on failure: enough to debug without sending the runs folder.
+# Never includes IMSI, UDID or serial numbers.
+DIAG = {}
+
+
+def win_file_version(path):
+    try:
+        v = C.windll.version
+        size = v.GetFileVersionInfoSizeW(str(path), None)
+        if not size: return None
+        buf = C.create_string_buffer(size)
+        if not v.GetFileVersionInfoW(str(path), 0, size, buf): return None
+        ptr, length = C.c_void_p(), C.c_uint()
+        if not v.VerQueryValueW(buf, '\\', C.byref(ptr), C.byref(length)): return None
+        info = C.cast(ptr, C.POINTER(C.c_uint32 * 13)).contents
+        ms, ls = info[2], info[3]
+        return f'{ms >> 16}.{ms & 0xffff}.{ls >> 16}.{ls & 0xffff}'
+    except Exception:
+        return None
+
+
+def sysctl(name):
+    try:
+        return subprocess.run(['/usr/sbin/sysctl', '-n', name], capture_output=True, text=True, timeout=5).stdout.strip() or None
+    except Exception:
+        return None
+
+
+def environment_info():
+    import platform
+    from importlib.metadata import version, metadata, PackageNotFoundError
+    rows = [('Сборка скрипта', digest((ROOT/'carrier.py').read_bytes())[:12]),
+            ('Python', f"{sys.version.split()[0]} {platform.machine()} {'64' if sys.maxsize > 2**32 else '32'}-bit")]
+    libs = []
+    for name in ('pymobiledevice3', 'cryptography', 'pyimg4', 'pylzss', 'lzfse'):
+        try:
+            placeholder = 'placeholder' in (metadata(name).get('Summary') or '')
+            libs.append(f"{name} {version(name)}{' (заглушка)' if placeholder else ''}")
+        except PackageNotFoundError:
+            libs.append(f'{name} нет')
+    rows.append(('Библиотеки', ', '.join(libs)))
+    if sys.platform == 'darwin':
+        cpu = 'Apple Silicon' if sysctl('hw.optional.arm64') == '1' else 'Intel'
+        if sysctl('sysctl.proc_translated') == '1': cpu += ', Python под Rosetta'
+        rows.append(('macOS', f"{platform.mac_ver()[0]} · {sysctl('hw.model') or '?'} · {cpu} · {sysctl('machdep.cpu.brand_string') or ''}".rstrip(' ·')))
+        try:
+            at = plistlib.loads(Path('/System/Library/PrivateFrameworks/AirTrafficHost.framework/Resources/Info.plist').read_bytes())
+            rows.append(('AirTrafficHost', f"{at.get('CFBundleShortVersionString')} ({at.get('CFBundleVersion')})"))
+        except Exception:
+            rows.append(('AirTrafficHost', 'версия не прочитана'))
+    elif sys.platform == 'win32':
+        w = sys.getwindowsversion()
+        rows.append(('Windows', f"{platform.release()} {platform.version()} (build {w.build}) · {platform.machine()}"))
+        dirs = [Path(d) for d in APPLE_DIRS]
+        for key in ('CommonProgramW6432', 'CommonProgramFiles'):
+            if os.environ.get(key):
+                dirs += [Path(os.environ[key])/'Apple'/'Mobile Device Support', Path(os.environ[key])/'Apple'/'Apple Application Support']
+        found = {}
+        for d in dict.fromkeys(dirs):
+            for name in ('AirTrafficHost.dll', 'MobileDevice.dll', 'CoreFoundation.dll'):
+                if name not in found and (d/name).is_file():
+                    found[name] = f'{win_file_version(d/name) or "?"} ({d})'
+        for name in ('AirTrafficHost.dll', 'MobileDevice.dll', 'CoreFoundation.dll'):
+            rows.append((name, found.get(name, 'не найдена')))
+        itunes = [Path(os.environ[k])/'iTunes'/'iTunes.exe' for k in ('ProgramW6432', 'ProgramFiles') if os.environ.get(k)]
+        itunes = next((x for x in itunes if x.is_file()), None)
+        rows.append(('iTunes', win_file_version(itunes) if itunes else 'iTunes.exe не найден (возможно, версия из Microsoft Store)'))
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SYSTEM\CurrentControlSet\Services\Apple Mobile Device Service') as k:
+                rows.append(('Apple Mobile Device Service', 'установлена'))
+        except Exception:
+            rows.append(('Apple Mobile Device Service', 'не найдена'))
+    else:
+        rows.append(('ОС', platform.platform()))
+    return rows
+
+
+def run_details(run):
+    rows = []
+    for journal in sorted(run.glob('*/journal.json'), key=lambda p: p.stat().st_mtime):
+        stage = journal.parent
+        try: j = read_json(journal)
+        except Exception: continue
+        line = f"фаза {j.get('phase')}, завершён {bool(j.get('complete'))}, Books восстановлен {j.get('books_restored')}"
+        if j.get('operation_error'): line += f", ошибка: {j['operation_error']}"
+        rows.append((f'Этап {stage.name}', line))
+        try:
+            b = read_json(stage/'books.json'); tree = read_tree_zip(stage/'books.zip')
+            known = [n for n in (x.removeprefix('Books/') for x in BOOK_FILES + BOOK_DIRS[1:]) if n in tree]
+            rows.append(('  Books до операции', f"{'был' if b.get('existed') else 'не было'}, объектов {len(tree)}, служебные: {', '.join(known) or 'нет'}"))
+        except Exception:
+            pass
+        host = stage/'host.jsonl'
+        if host.exists():
+            for raw in host.read_text(encoding='utf-8', errors='replace').splitlines():
+                if not raw.startswith('CARRIER_SWAP_JSON:'): continue
+                try: row = json.loads(raw.split(':', 1)[1])
+                except ValueError: continue
+                if row.get('event') == 'manifest':
+                    book = row.get('book', [])
+                    expected = set(row.get('expected', []))
+                    rows.append(('  Ответ AirTraffic', f"типы {row.get('dataclasses')}, объектов Book {len(book)}, "
+                                 f"IsDownload {sum(1 for x in book if x.get('IsDownload') in ('True', '1'))}, "
+                                 f"наших {sum(1 for x in book if x.get('AssetID') in expected)} из {len(expected)}"))
+                    for x in book[:5]:
+                        rows.append(('    Book', ', '.join(f'{k}={v[:60]}' for k, v in x.items())))
+                elif row.get('ok') is False:
+                    rows.append(('  Ошибка AirTraffic', str(row.get('error'))))
+        err = stage/'host.stderr'
+        if err.exists():
+            tail = [l.strip()[:200] for l in err.read_text(encoding='utf-8', errors='replace').splitlines() if l.strip()][-5:]
+            for l in tail: rows.append(('  host.stderr', l))
+    for name in ('initialize', 'rescan'):
+        f = run/name/'installation.json'
+        if f.exists():
+            try:
+                j = read_json(f)
+                rows.append((f'Триггер ({name})', f"установлен {j.get('ipcc_installation_completed')}"
+                             + (f", ошибка: {j['installation_error']}" if j.get('installation_error') else '')
+                             + (f", журнал: {j['log_error']}" if j.get('log_error') else '')))
+            except Exception:
+                pass
+    return rows
+
+
+def print_diagnostics(error):
+    rows = []
+    try: rows += environment_info()
+    except Exception as e: rows.append(('Окружение', f'не собрано: {e}'))
+    info = DIAG.get('info')
+    if info:
+        rows.append(('iPhone', f"{MODELS.get(info['ProductType'], {}).get('name', '?')} · {info['ProductType']} · "
+                     f"{info['HardwareModel']} · iOS {info['ProductVersion']} ({info['BuildVersion']}) · {info['ActivationState']}"))
+        for c in info.get('carriers', []):
+            rows.append(('  SIM', f"{c.get('Slot')} {c.get('MCC','')}{c.get('MNC','')} {c.get('CFBundleIdentifier','')} {c.get('CFBundleVersion','')}"))
+    args = DIAG.get('args')
+    if args is not None:
+        rows.append(('Действие', ' '.join(a for a in sys.argv[1:]) or 'установка'))
+        rows.append(('Профиль', f"{getattr(args, 'bundle', BUNDLE)}, SIM: {getattr(args, 'sims', 'all')}"))
+    if DIAG.get('trigger'): rows.append(('Триггер', DIAG['trigger']))
+    run = DIAG.get('run')
+    if run:
+        rows.append(('Папка операции', str(run)))
+        try: rows += run_details(run)
+        except Exception as e: rows.append(('Журналы', f'не прочитаны: {e}'))
+    rows.append(('Ошибка', f'{type(error).__name__}: {error}'))
+    print('\n===== Данные для отладки: скопируйте этот блок автору =====', file=sys.stderr)
+    for k, v in rows: print(f'{k}: {v}', file=sys.stderr)
+    print('===== конец блока =====\n', file=sys.stderr, flush=True)
+
 
 
 def main():
@@ -1045,6 +1202,7 @@ def main():
     parser.add_argument('--runs',type=Path,default=ROOT/'runs',metavar='ПАПКА',help='куда сохранять копии и журналы (по умолчанию runs рядом со скриптом)')
     parser._optionals.title='Параметры'
     args=parser.parse_args()
+    DIAG['args']=args
     args.bundle=args.bundle.strip().removesuffix('.bundle')+'.bundle'
     require(re.fullmatch(r'[A-Za-z0-9_]+\.bundle',args.bundle),
             'Имя пакета может содержать только латинские буквы, цифры и _, например O2_Germany.')
@@ -1066,6 +1224,7 @@ def main():
     require(check.returncode==0 and frames and frames[-1].get('ok'),
             'Библиотеки Apple недоступны: '+str(frames[-1].get('error') if frames else check.stderr.strip()))
     if args.check:
+        for k,v in environment_info():print(f'{k}: {v}')
         print('Триггеры целы, библиотеки Apple доступны; пакеты будут взяты из системы iPhone. Подключений к телефону не было.');return 0
     args.runs=args.runs.resolve()
     try:
@@ -1084,4 +1243,6 @@ if __name__=='__main__':
     except KeyboardInterrupt:
         print('Прервано. Не удаляйте папку runs. Если запись уже началась, '+recover_hint()+'.',file=sys.stderr);sys.exit(130)
     except Exception as e:
+        if not (len(sys.argv)>1 and sys.argv[1]=='--_host'):
+            with contextlib.suppress(Exception):print_diagnostics(e)
         print('Ошибка:',str(e),file=sys.stderr);sys.exit(1)
