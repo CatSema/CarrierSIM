@@ -250,6 +250,78 @@ async def purge_stale_books(afc, run):
     return removed
 
 
+
+# ---- Leftovers of earlier runs, removed from the phone itself (no need to keep old runs folders).
+LEFTOVER = re.compile(r'airlift-(src|link|saved)-[0-9a-f]{20}')
+OUTSTANDING_DB = 'Books/Sync/Database/OutstandingAssets_4.sqlite'
+
+
+async def remove_tree(afc, path):
+    # AFC stat does not follow symlinks: a link is removed itself, never what it points to.
+    node = await afc.stat(path)
+    if node['st_ifmt'] == 'S_IFDIR':
+        for child in await afc.listdir(path):
+            require(child not in ('', '.', '..') and '/' not in child, 'Invalid remote name')
+            await remove_tree(afc, path + '/' + child)
+    await afc.rm_single(path)
+
+
+async def purge_outstanding(afc, run):
+    # Books' queue of unfinished sync downloads. Rows of an interrupted run make atc skip the
+    # catalog. Only when every row is ours is the database removed (Books recreates it empty).
+    import sqlite3
+    files = {}
+    for suffix in ('', '-wal', '-shm'):
+        if await exists(afc, OUTSTANDING_DB + suffix):
+            files[suffix] = await afc.get_file_contents(OUTSTANDING_DB + suffix)
+    if '' not in files:
+        return None
+    with tempfile.TemporaryDirectory() as d:
+        for suffix, data in files.items(): (Path(d)/('db.sqlite' + suffix)).write_bytes(data)
+        try:
+            db = sqlite3.connect(Path(d)/'db.sqlite')
+            try: rows = [r[0] or '' for r in db.execute('select ZPERSISTENTID from ZBCOUTSTANDINGASSET')]
+            finally: db.close()
+        except sqlite3.Error as error:
+            return 'не прочитана: ' + str(error)
+    mine = [x for x in rows if 'airlift-' in x or x.endswith('Carrier Bundles/iPhone')]
+    if not mine:
+        return 0
+    if len(mine) != len(rows):
+        return f'оставлена: наших {len(mine)} из {len(rows)}'
+    (run / 'books-stale').mkdir(exist_ok=True)
+    for suffix, data in files.items():
+        (run / 'books-stale' / ('OutstandingAssets_4.sqlite' + suffix)).write_bytes(data)
+    for suffix in ('-wal', '-shm', ''):
+        if suffix in files: await afc.rm_single(OUTSTANDING_DB + suffix)
+    return len(mine)
+
+
+async def clean_phone(device, run):
+    from pymobiledevice3.services.afc import AfcService
+    report = {}
+    async with AfcService(device) as afc:
+        for name in sorted(n for n in await afc.listdir('/') if LEFTOVER.fullmatch(n)):
+            node = await afc.stat(name)
+            if name.startswith('airlift-saved-') and node['st_ifmt'] == 'S_IFDIR':
+                # An exported carrier catalog. Keep a local copy before removing it.
+                with contextlib.suppress(Exception):
+                    (run / 'media-leftovers').mkdir(exist_ok=True)
+                    write_tree_zip(run / 'media-leftovers' / (name + '.zip'), await remote_tree(afc, name))
+            try:
+                await remove_tree(afc, name)
+                report[name] = 'удалён'
+            except Exception as error:
+                report[name] = 'не удалён: ' + str(error)
+        lists = await purge_stale_books(afc, run)
+        if lists: report['списки Books'] = lists
+        outstanding = await purge_outstanding(afc, run)
+        if outstanding: report['загрузки Books'] = outstanding
+    save_json(run / 'cleanup.json', report)
+    DIAG['cleanup'] = report
+    return report
+
+
 async def restore_books(afc, tree, existed):
     for path in BOOK_FILES:
         rel = path.removeprefix('Books/')
@@ -329,8 +401,12 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
     token = os.urandom(10).hex()
     source, link, exported = ('airlift-' + t + '-' + token for t in ('src', 'link', 'saved'))
     final_source = source + '/' + PAYLOAD_PATH if payload is not None else exported
+    # Books keeps finished items in Sync/Database/OutstandingAssets_4.sqlite keyed by this ID.
+    # A fixed '../../../Library/...' ID matches rows left by an interrupted run and atc then
+    # skips the catalog (installOnly). Going through this run's staging folder resolves to the
+    # same path (Media/<source>/../../Library = /var/mobile/Library) but is unique per run.
     assets = [(f'../../{source}/p0/p1/p2/link', link),
-              ('../../../' + TARGET.removeprefix('/var/mobile/'), exported),
+              (f'../../{source}/../../' + TARGET.removeprefix('/var/mobile/'), exported),
               ('../../' + final_source, link + '/iPhone')]
     journal = {'schema': 1, 'udid_hash': digest(device.udid.encode()), 'target': TARGET,
                'source': source, 'link': link, 'exported': exported,
@@ -343,6 +419,9 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
     async with AfcService(device) as afc:
         for path in (source, link, exported):
             require(await exists(afc, path) is None, 'Staging path collision')
+        leftovers = sorted(n for n in await afc.listdir('/') if n.startswith('airlift-'))
+        if leftovers:
+            journal['media_leftovers'] = leftovers; save_json(run / 'journal.json', journal)
         stale = await purge_stale_books(afc, run)
         if stale:
             journal['stale_books_removed'] = stale; save_json(run / 'journal.json', journal)
@@ -1037,6 +1116,10 @@ async def execute(args,assets):
             check_trigger(trigger,plmns,args.bundle);check_trigger_hardware(trigger,info['HardwareModel'])
         require(trigger is not None,'Не найден независимый триггер для этих SIM.')
         DIAG['trigger']=trigger.name
+        if not args.recover:
+            # No unfinished stage is known here (checked above), so AirLift leftovers are stale.
+            cleaned=await clean_phone(device,run)
+            if cleaned:print('Убраны остатки прошлых запусков: '+', '.join(cleaned),flush=True)
         if args.recover:
             if isinstance(args.recover,list):await recover_all(device,args.recover,run)
             else:await recover_stage(device,args.recover.resolve(),run)
@@ -1190,6 +1273,23 @@ def environment_info():
     return rows
 
 
+
+def outstanding_assets(tree):
+    # Read Books/Sync/Database/OutstandingAssets_4.sqlite (with its WAL) from a Books backup.
+    import sqlite3
+    base = 'Sync/Database/OutstandingAssets_4.sqlite'
+    if base not in tree: return None
+    with tempfile.TemporaryDirectory() as d:
+        for suffix in ('', '-wal', '-shm'):
+            if base + suffix in tree: (Path(d)/('db.sqlite' + suffix)).write_bytes(tree[base + suffix][1])
+        try:
+            db = sqlite3.connect(Path(d)/'db.sqlite')
+            try: return db.execute('select ZPERSISTENTID, ZDOWNLOADCOMPLETEPATH from ZBCOUTSTANDINGASSET').fetchall()
+            finally: db.close()
+        except sqlite3.Error:
+            return None
+
+
 def run_details(run):
     rows = []
     for journal in sorted(run.glob('*/journal.json'), key=lambda p: p.stat().st_mtime):
@@ -1198,12 +1298,21 @@ def run_details(run):
         except Exception: continue
         line = f"фаза {j.get('phase')}, завершён {bool(j.get('complete'))}, Books восстановлен {j.get('books_restored')}"
         if j.get('stale_books_removed'): line += f", удалены старые записи: {j['stale_books_removed']}"
+        if j.get('media_leftovers'):
+            old = sorted({n.rsplit('-', 1)[-1] for n in j['media_leftovers']} - {str(j.get('source', '')).rsplit('-', 1)[-1]})
+            rows.append(('  Остатки прошлых запусков в Media', ', '.join(j['media_leftovers'][:12]) + (f' (запусков: {len(old)})' if old else '')))
         if j.get('operation_error'): line += f", ошибка: {j['operation_error']}"
         rows.append((f'Этап {stage.name}', line))
         try:
             b = read_json(stage/'books.json'); tree = read_tree_zip(stage/'books.zip')
             known = [n for n in (x.removeprefix('Books/') for x in BOOK_FILES + BOOK_DIRS[1:]) if n in tree]
             rows.append(('  Books до операции', f"{'был' if b.get('existed') else 'не было'}, объектов {len(tree)}, служебные: {', '.join(known) or 'нет'}"))
+            outstanding = outstanding_assets(tree)
+            if outstanding is not None:
+                mine = [x for x in outstanding if 'airlift-' in (x[0] or '') or (x[0] or '').endswith('Carrier Bundles/iPhone')]
+                rows.append(('  Незавершённые загрузки Books', f'{len(outstanding)}, из них скрипта {len(mine)}'))
+                for pid, done in mine[:6]:
+                    rows.append(('    загрузка', f'{pid} → {done or "не завершена"}'))
             traces = sorted(n for n, (k, d) in tree.items() if k == 'f' and b'airlift' in d)
             if traces: rows.append(('  Следы airlift в Books', ', '.join(traces)))
         except Exception:
@@ -1272,6 +1381,7 @@ def print_diagnostics(error):
         rows.append(('Действие', ' '.join(a for a in sys.argv[1:]) or 'установка'))
         rows.append(('Профиль', f"{getattr(args, 'bundle', BUNDLE)}, SIM: {getattr(args, 'sims', 'all')}"))
     if DIAG.get('trigger'): rows.append(('Триггер', DIAG['trigger']))
+    if DIAG.get('cleanup'): rows.append(('Очистка телефона', json.dumps(DIAG['cleanup'], ensure_ascii=False)[:600]))
     run = DIAG.get('run')
     if run:
         rows.append(('Папка операции', str(run)))
