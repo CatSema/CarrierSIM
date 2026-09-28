@@ -5,7 +5,7 @@ set "PYTHONUTF8=1"
 cd /d "%~dp0"
 if errorlevel 1 exit /b 1
 set "CARRIER_PY="
-for %%V in (3.14 3.13 3.12 3.11) do (
+for %%V in (3.12 3.11 3.13 3.14) do (
     py -%%V -c "import sys; assert sys.version_info >= (3,11) and sys.maxsize > 2**32" >nul 2>&1
     if not errorlevel 1 (
         set "CARRIER_PY=py -%%V"

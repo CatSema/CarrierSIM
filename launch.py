@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Локальное окружение и меню запуска. Сам по себе телефон не изменяет."""
+import base64
+import hashlib
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 ROOT = Path(__file__).resolve().parent
 
@@ -21,6 +25,37 @@ def check_writable():
                            'в «Загрузки» и запустите оттуда.') from None
 
 
+# pyimg4 (pulled in by pymobiledevice3) requires these compressors, but CarrierSIM never
+# imports pyimg4. They ship wheels only up to Python 3.12, so on 3.13+ pip would need a
+# C compiler. Empty placeholder distributions satisfy the requirement instead.
+PLACEHOLDERS = (('pylzss', '0.3.4'), ('lzfse', '0.4.2'))
+
+
+def placeholder_wheel(directory, name, version):
+    info = f'{name}-{version}.dist-info'
+    files = {f'{info}/METADATA': f'Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n'
+                                 'Summary: CarrierSIM placeholder; the real package is not used\n',
+             f'{info}/WHEEL': 'Wheel-Version: 1.0\nGenerator: carriersim\nRoot-Is-Purelib: true\nTag: py3-none-any\n'}
+    record = ''.join(f'{n},sha256={base64.urlsafe_b64encode(hashlib.sha256(d.encode()).digest()).rstrip(b"=").decode()},'
+                     f'{len(d.encode())}\n' for n, d in files.items()) + f'{info}/RECORD,,\n'
+    path = Path(directory) / f'{name}-{version}-py3-none-any.whl'
+    with zipfile.ZipFile(path, 'w') as archive:
+        for n, d in files.items():
+            archive.writestr(n, d)
+        archive.writestr(f'{info}/RECORD', record)
+    return str(path)
+
+
+def install_dependencies(python, version):
+    pip = [str(python), '-m', 'pip', 'install', '--disable-pip-version-check']
+    if version >= (3, 13):
+        with tempfile.TemporaryDirectory() as directory:
+            wheels = [placeholder_wheel(directory, n, v) for n, v in PLACEHOLDERS]
+            if subprocess.run(pip + ['--no-deps', '--no-index', *wheels]).returncode:
+                return False
+    return not subprocess.run(pip + ['-r', str(ROOT / 'requirements.txt')]).returncode
+
+
 def python_environment():
     if sys.version_info < (3, 11):
         raise RuntimeError('Нужен Python 3.11 или новее: https://www.python.org/downloads/')
@@ -28,25 +63,41 @@ def python_environment():
         raise RuntimeError('На Windows нужен Python x64.')
     env = ROOT / '.venv'
     python = env / ('Scripts/python.exe' if sys.platform == 'win32' else 'bin/python')
-    if not env.exists():
-        print('Создаю локальное окружение .venv…', flush=True)
-        subprocess.run([sys.executable, '-m', 'venv', str(env)], check=True)
-    if not python.is_file():
-        raise RuntimeError('Папка .venv неполная или создана на другой ОС. Переименуйте её и повторите запуск.')
-    probe = subprocess.run([str(python), '-c',
-        'import sys; assert sys.version_info >= (3,11); '
-        'assert sys.platform != "win32" or sys.maxsize > 2**32'], capture_output=True)
-    if probe.returncode:
-        raise RuntimeError('Python в .venv не подходит. Переименуйте папку .venv и повторите запуск.')
-    dependencies = subprocess.run([str(python), '-c',
-        'from importlib.metadata import version; '
-        'assert version("pymobiledevice3") == "11.12.5"; '
-        'from pymobiledevice3.services.afc import AfcService; '
-        'from pymobiledevice3.services.installation_proxy import InstallationProxyService'], capture_output=True)
-    if dependencies.returncode:
-        print('Устанавливаю зависимости в .venv. Для этого нужен интернет…', flush=True)
-        subprocess.run([str(python), '-m', 'pip', 'install', '--disable-pip-version-check',
-                        '-r', str(ROOT / 'requirements.txt')], check=True)
+    current = '%d.%d' % sys.version_info[:2]
+    for attempt in range(2):
+        if not env.exists():
+            print('Создаю локальное окружение .venv…', flush=True)
+            subprocess.run([sys.executable, '-m', 'venv', str(env)], check=True)
+        if not python.is_file():
+            raise RuntimeError('Папка .venv неполная или создана на другой ОС. Переименуйте её и повторите запуск.')
+        probe = subprocess.run([str(python), '-c',
+            'import sys; assert sys.version_info >= (3,11); '
+            'assert sys.platform != "win32" or sys.maxsize > 2**32; '
+            'print("%d.%d" % sys.version_info[:2])'], capture_output=True, text=True)
+        if probe.returncode:
+            raise RuntimeError('Python в .venv не подходит. Переименуйте папку .venv и повторите запуск.')
+        version = probe.stdout.strip()
+        dependencies = subprocess.run([str(python), '-c',
+            'from importlib.metadata import version; '
+            'assert version("pymobiledevice3") == "11.12.5"; '
+            'from pymobiledevice3.services.afc import AfcService; '
+            'from pymobiledevice3.services.installation_proxy import InstallationProxyService'], capture_output=True)
+        if not dependencies.returncode:
+            return python
+        if version == current or attempt:
+            break
+        # A half-installed .venv from another Python (e.g. a failed 3.14 attempt) is rebuilt
+        # with the interpreter the launcher picked; a working .venv is never touched.
+        print(f'Пересоздаю .venv: было Python {version}, теперь {current}…', flush=True)
+        shutil.rmtree(env)
+    print('Устанавливаю зависимости в .venv. Для этого нужен интернет…', flush=True)
+    if not install_dependencies(python, tuple(map(int, version.split('.')))):
+        if tuple(map(int, version.split('.'))) >= (3, 13):
+            raise RuntimeError(f'Не удалось установить зависимости для Python {version}.\n'
+                               'Что сделать: установите Python 3.12 с python.org '
+                               '(на Windows — «Windows installer (64-bit)» версии 3.12.10), '
+                               'старый Python удалять не нужно. Затем запустите скрипт снова.')
+        raise RuntimeError('Не удалось установить зависимости. Проверьте интернет и запустите скрипт снова.')
     return python
 
 

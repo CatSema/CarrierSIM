@@ -1,1 +1,2 @@
 pymobiledevice3==11.12.5
+pyimg4==0.8.8
