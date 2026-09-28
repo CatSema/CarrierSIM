@@ -2,6 +2,7 @@
 """Локальное окружение и меню запуска. Сам по себе телефон не изменяет."""
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -49,7 +50,8 @@ def menu():
           '  3  Проверить компьютер и файлы\n\n'
           '  4  Вернуть штатные профили (удалить IMSI-ссылки)\n'
           '  5  Восстановить после сбоя\n'
-          '  6  Открыть справку\n\n'
+          '  6  Открыть справку\n'
+          '  7  Выбрать другой профиль\n\n'
           '  0  Выход\n')
     while True:
         choice = input('  Ваш выбор: ').strip()
@@ -60,7 +62,28 @@ def menu():
         if choice == '6': return ['--help']
         if choice == '4': return ['--restore']
         if choice == '5': return ['--recover']
-        print('Введите число от 0 до 6. Установка ещё не начата.')
+        if choice == '7': return other_profile()
+        print('Введите число от 0 до 7. Установка ещё не начата.')
+
+
+def other_profile():
+    print('\n  Имя системного пакета оператора на iPhone, как в /System/Library/Carrier Bundles/iPhone.\n'
+          '  Например: O2_Germany, Swisscom_ch, Vodafone_hu. Регистр букв важен.\n'
+          '  Пустой ввод — вернуться в меню.')
+    while True:
+        name = input('  Профиль: ').strip().removesuffix('.bundle')
+        if not name: return False
+        if re.fullmatch(r'[A-Za-z0-9_]+', name): break
+        print('  Только латинские буквы, цифры и _. Например: O2_Germany.')
+    print('\n  На какие SIM установить?\n'
+          '  1  SIM 1\n'
+          '  2  SIM 2\n'
+          '  Enter — обе (все найденные)')
+    while True:
+        sims = input('  SIM: ').strip()
+        if sims in ('', '1', '2'): break
+        print('  Введите 1, 2 или нажмите Enter.')
+    return ['--bundle', name, '--sims', sims or 'all']
 
 
 def main():

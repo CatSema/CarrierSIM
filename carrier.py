@@ -343,7 +343,7 @@ async def device_info(device):
                           for r in rows]
     return result
 
-def check_trigger(path, sims):
+def check_trigger(path, sims, target=BUNDLE):
     require(path.suffix == '.ipcc', 'Trigger must be an IPCC')
     tree = read_tree_zip(path)
     bundles = {n.split('/')[1] for n in tree if n.startswith('Payload/') and len(n.split('/')) > 1
@@ -352,7 +352,7 @@ def check_trigger(path, sims):
     name = bundles.pop()
     inner = {n.removeprefix('Payload/'): v for n, v in tree.items() if n.startswith('Payload/')}
     info, carrier = bundle_info(inner, name)
-    require(name != BUNDLE and info.get('CFBundleIdentifier') != 'com.apple.Viva_kw', 'Viva is not an independent trigger')
+    require(name != target and info.get('CFBundleIdentifier') != 'com.apple.Viva_kw', 'Viva is not an independent trigger')
     identifiers = carrier.get('SupportedSIMs', [])
     require(identifiers and all(isinstance(s, str) and re.fullmatch(r'\d{5,6}(?:_.*)?', s) for s in identifiers),
             'Unknown SupportedSIMs format in trigger')
@@ -620,33 +620,45 @@ def load_assets():
     path = ROOT/'assets.zip'
     require(digest(path.read_bytes()) == ASSET_SHA256, 'Архив assets.zip повреждён или заменён.')
     tree = read_tree_zip(path)
-    targets = {name: ('l', (SYSTEM_PREFIX+name).encode()) for name in TARGET_BUNDLES}
-    return targets, tree
+    return tree
 
 
-def select_sims(rows):
+def bundle_link(name):
+    require(re.fullmatch(r'[A-Za-z0-9_]+\.bundle', name), 'Неверное имя пакета: '+name)
+    return ('l', (SYSTEM_PREFIX+name).encode())
+
+
+SLOT_NAMES = {'kOne': 'SIM 1', 'kTwo': 'SIM 2'}
+SLOT_CHOICES = {'1': ('kOne',), '2': ('kTwo',), 'all': ('kOne', 'kTwo')}
+
+
+def select_sims(rows, bundle=BUNDLE, slots=SLOT_CHOICES['all']):
     selected = []; seen_slots = set(); seen_imsi = set()
     for row in rows:
         mcc, mnc = str(row.get('MCC','')), str(row.get('MNC',''))
         slot, imsi = row.get('Slot'), row.get('InternationalMobileSubscriberIdentity')
         require(slot in ('kOne','kTwo') and slot not in seen_slots, 'Неоднозначные слоты SIM; запись отменена.')
+        seen_slots.add(slot)
+        if slot not in slots: continue
         require(re.fullmatch(r'\d{3}',mcc) and re.fullmatch(r'\d{2,3}',mnc) and isinstance(imsi,str) and
                 re.fullmatch(r'\d{15}',imsi) and imsi.startswith(mcc+mnc),
                 'iPhone не сообщил полный IMSI для SIM '+mcc+mnc+'. Включите линию и разблокируйте телефон.')
         require(imsi not in seen_imsi, 'Один IMSI указан в двух слотах; запись отменена.')
-        seen_slots.add(slot); seen_imsi.add(imsi)
-        selected.append({'slot':slot,'plmn':mcc+mnc,'imsi':imsi,'bundle':BUNDLE})
+        seen_imsi.add(imsi)
+        selected.append({'slot':slot,'plmn':mcc+mnc,'imsi':imsi,'bundle':bundle})
+    missing = [SLOT_NAMES[s] for s in slots if s not in seen_slots]
+    require(len(slots) > 1 or not missing, missing and missing[0]+' не найдена в iPhone. Выберите другую SIM.')
     require(selected, 'Телефон не сообщил ни одной SIM с доступным IMSI.')
     return selected
 
 
-def make_plan(original, sims, targets):
+def make_plan(original, sims):
     desired = dict(original)
     # Signed system bundles match the phone's own firmware; only exact IMSI aliases change.
     for sim in sims:
         n = sim['imsi']
         require(n not in original or original[n][0]=='l', 'Вместо ссылки IMSI обнаружен файл или каталог.')
-        desired[n] = targets[sim['bundle']]
+        desired[n] = bundle_link(sim['bundle'])
     validate_tree(desired)
     return desired
 
@@ -714,12 +726,12 @@ def transient_error(error):
         ('Сбой AirTraffic','Final source not consumed'))
 
 
-async def execute_with_retry(args,bundles,assets):
+async def execute_with_retry(args,assets):
     # Once selected, reconnect only to this exact phone, even if a different phone appears.
     args.udid=await choose_device(args.udid,args.wait_seconds)
     for attempt in range(1,args.attempts+1):
         print(f'Попытка {attempt} из {args.attempts}',flush=True)
-        try:return await execute(args,bundles,assets)
+        try:return await execute(args,assets)
         except Exception as error:
             if not transient_error(error):raise
             failed=pending(args.runs,args.udid)
@@ -846,26 +858,27 @@ def check_trigger_hardware(path, hardware):
 
 
 
-async def execute(args,bundles,assets):
+async def execute(args,assets):
     udid=args.udid
     device=await ready_device(udid,args.wait_seconds)
     run=None
     try:
         info=await device_info(device); check_phone(info)
         rows=await device.get_value(key='CarrierBundleInfoArray') or []
-        sims=select_sims(rows) if not (args.restore or args.restore_backup or args.recover) else []
+        slots=SLOT_CHOICES[args.sims]
+        sims=select_sims(rows,args.bundle,slots) if not (args.restore or args.restore_backup or args.recover) else []
         if args.restore:
             sims=[{'slot':r['Slot'],'plmn':str(r.get('MCC',''))+str(r.get('MNC','')),'bundle':None}
                   for r in rows if r.get('Slot') in ('kOne','kTwo')]
         print(f"\n  {MODELS.get(info['ProductType'], {}).get('name', info['ProductType'])} · iOS {info['ProductVersion']} ({info['BuildVersion']})",flush=True)
         for s in sims:
             label = {'kOne':'SIM 1', 'kTwo':'SIM 2'}[s['slot']]
-            target='штатный профиль' if args.restore else 'Vodafone HU (по IMSI)'
+            target='штатный профиль' if args.restore else args.bundle.removesuffix('.bundle')+' (по IMSI)'
             print(f"  {label}  ·  {s['plmn']}  →  {target}",flush=True)
         print(flush=True)
         if args.status: return
         if args.trigger:
-            check_trigger(args.trigger,{str(r.get('MCC',''))+str(r.get('MNC','')) for r in rows})
+            check_trigger(args.trigger,{str(r.get('MCC',''))+str(r.get('MNC','')) for r in rows},args.bundle)
             check_trigger_hardware(args.trigger,info['HardwareModel'])
         unresolved=pending(args.runs,udid)
         if args.recover == Path('AUTO'):
@@ -886,13 +899,13 @@ async def execute(args,bundles,assets):
         for name in (() if args.trigger else ('AVEA_tr.ipcc','Swisscom_ch.ipcc','O2_Germany.ipcc')):
             candidate=run/name;candidate.write_bytes(assets['triggers/'+name][1])
             try:
-                check_trigger(candidate,plmns)
+                check_trigger(candidate,plmns,args.bundle)
                 check_trigger_hardware(candidate,info['HardwareModel'])
                 trigger=candidate;break
             except RuntimeError:candidate.unlink()
         if args.trigger:
             trigger=run/'custom-trigger.ipcc';trigger.write_bytes(args.trigger.read_bytes())
-            check_trigger(trigger,plmns);check_trigger_hardware(trigger,info['HardwareModel'])
+            check_trigger(trigger,plmns,args.bundle);check_trigger_hardware(trigger,info['HardwareModel'])
         require(trigger is not None,'Не найден независимый триггер для этих SIM.')
         if args.recover:
             await recover_stage(device,args.recover.resolve(),run)
@@ -922,9 +935,9 @@ async def execute(args,bundles,assets):
             print('[2/4] Сохраняю исходные настройки…',flush=True)
             original=await transfer(device,run/'snapshot')
             require(original is not None,'Не удалось сохранить исходный каталог.')
-            current=select_sims(await device.get_value(key='CarrierBundleInfoArray') or [])
+            current=select_sims(await device.get_value(key='CarrierBundleInfoArray') or [],args.bundle,slots)
             require(current==sims,'SIM изменились во время операции; запись отменена.')
-            desired=make_plan(original,sims,bundles)
+            desired=make_plan(original,sims)
             save_json(run/'plan.json',{'slots':[{k:v for k,v in s.items() if k!='imsi'} for s in sims],
                                       'before':tree_hash(original),'after':tree_hash(desired)})
             print('[3/4] Записываю ссылки по IMSI и проверяю результат…',flush=True)
@@ -937,10 +950,26 @@ async def execute(args,bundles,assets):
         save_json(run/'result.json',{'catalog_verified':True,'installation':installation,'slots':result})
         unconfirmed=False
         for s in result:
-            ok=s['verified'] and (args.restore or s['selected']==s['expected']);unconfirmed |= not ok
-            print(f"{dict(kOne='SIM 1', kTwo='SIM 2')[s['slot']]} ({s['plmn']}): "+(s['selected']+' — подпись принята' if ok else
+            ok=s['verified'] and (args.restore or (s['selected'] or '').lower()==s['expected'].lower());unconfirmed |= not ok
+            print(f"{SLOT_NAMES[s['slot']]} ({s['plmn']}): "+(s['selected']+' — подпись принята' if ok else
                   'выбор нужного пакета не подтверждён; см. журнал'),flush=True)
         if args.restore:print('Все ссылки по IMSI удалены. Обычные ссылки операторов сохранены.',flush=True)
+        installing=not (args.restore or args.restore_backup or args.recover)
+        if installing and args.bundle!=BUNDLE and not any(
+                (s['selected'] or '').lower()==s['expected'].lower() for s in result):
+            # AFC cannot read /System, so a missing bundle only shows up in the rescan log.
+            # Never leave links to it: put back the catalog saved before this write.
+            print('iOS не выбрала '+args.bundle+' ни для одной SIM: такого пакета, видимо, нет в этой '
+                  'версии iOS или имя введено с ошибкой. Возвращаю прежние настройки…',flush=True)
+            await transfer(device,run/'rollback',payload=original,expected=desired)
+            require(await transfer(device,run/'rollback-readback')==original,
+                    'Прежние настройки не вернулись: '+recover_hint()+'.')
+            rescan=run/'rescan-rollback';rescan.mkdir()
+            await install_trigger(device,trigger,rescan)
+            save_json(run/'result.json',{'catalog_verified':True,'installation':installation,'slots':result,
+                                         'rolled_back':True})
+            print('Прежние настройки возвращены. Проверьте имя пакета и повторите.',flush=True)
+            return 2
         if unconfirmed:return 2
         print('Готово. Включите авиарежим на 15 секунд и проверьте связь. Работа 5G не проверялась.')
         return 0
@@ -974,6 +1003,10 @@ def main():
     group.add_argument('--restore',action='store_true',help='удалить все ссылки по IMSI и включить штатный выбор профилей; путь не нужен')
     group.add_argument('--restore-backup',type=Path,metavar='КАТАЛОГ',help='дополнительно: вернуть каталог из конкретной резервной копии')
     group.add_argument('--recover',type=Path,nargs='?',const=Path('AUTO'),metavar='ЭТАП',help='восстановиться после сбоя автоматически; путь к этапу необязателен')
+    parser.add_argument('--bundle',default=BUNDLE,metavar='ПАКЕТ',
+                        help='системный пакет оператора на iPhone вместо Vodafone_hu, например O2_Germany')
+    parser.add_argument('--sims',choices=SLOT_CHOICES,default='all',
+                        help='на какие SIM установить: 1, 2 или all — все найденные (по умолчанию)')
     parser.add_argument('--trigger',type=Path,metavar='IPCC',help='свой подписанный IPCC вместо комплектного; плата и SIM проверяются')
     parser.add_argument('--attempts',type=int,default=3,metavar='N',help='попытки при временном сбое связи (по умолчанию 3)')
     parser.add_argument('--wait-seconds',type=int,default=180,metavar='СЕК',help='ожидать подключение и разблокировку (по умолчанию 180 секунд)')
@@ -982,6 +1015,9 @@ def main():
     parser.add_argument('--runs',type=Path,default=ROOT/'runs',metavar='ПАПКА',help='куда сохранять копии и журналы (по умолчанию runs рядом со скриптом)')
     parser._optionals.title='Параметры'
     args=parser.parse_args()
+    args.bundle=args.bundle.strip().removesuffix('.bundle')+'.bundle'
+    require(re.fullmatch(r'[A-Za-z0-9_]+\.bundle',args.bundle),
+            'Имя пакета может содержать только латинские буквы, цифры и _, например O2_Germany.')
     require(1 <= args.attempts <= 10, 'Число попыток должно быть от 1 до 10.')
     require(0 <= args.wait_seconds <= 3600, 'Ожидание должно быть от 0 до 3600 секунд.')
     os.umask(0o077)
@@ -990,7 +1026,7 @@ def main():
     try: installed=version('pymobiledevice3')
     except PackageNotFoundError: raise RuntimeError('Установите зависимости: python -m pip install -r requirements.txt')
     require(installed=='11.12.5', 'Нужен pymobiledevice3 11.12.5: python -m pip install -r requirements.txt')
-    bundles,assets=load_assets()
+    assets=load_assets()
     global APPLE_DIRS
     APPLE_DIRS=[str(Path(p).resolve()) for p in args.apple_dir]
     # No shell, no compiler, no native executable bundled with the archive.
@@ -1003,7 +1039,7 @@ def main():
         print('Триггеры целы, библиотеки Apple доступны; пакеты будут взяты из системы iPhone. Подключений к телефону не было.');return 0
     args.runs=args.runs.resolve()
     print('Разблокируйте iPhone и подтвердите доверие компьютеру. Закройте синхронизацию Finder/iTunes.',flush=True)
-    with operation_lock(args.runs):return asyncio.run(execute_with_retry(args,bundles,assets)) or 0
+    with operation_lock(args.runs):return asyncio.run(execute_with_retry(args,assets)) or 0
 
 
 if __name__=='__main__':
