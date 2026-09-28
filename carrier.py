@@ -178,11 +178,12 @@ async def remote_tree(afc, root):
             tree[name] = ('l', before['LinkTarget'].encode())
         elif kind == 'S_IFREG':
             require(name, 'Root is a file')
-            require(before['st_size'] <= MAX_BYTES, f'Файл больше {MAX_BYTES >> 20} МБ: {path}')
+            require(before['st_size'] <= MAX_BYTES, f'Файл больше {MAX_BYTES >> 20} МБ: {path} ({before["st_size"] >> 20} МБ)')
             data = await afc.get_file_contents(path)
             require(len(data) == before['st_size'], 'Файл изменился во время чтения: ' + path)
             total += len(data)
-            require(total <= MAX_BYTES, f'В {root} больше {MAX_BYTES >> 20} МБ данных: лимит скрипта')
+            require(total <= MAX_BYTES, f'В {root} больше {MAX_BYTES >> 20} МБ данных (прочитано {total >> 20} МБ, '
+                                        f'последний файл {path}, {len(data) >> 10} КБ): лимит скрипта')
             tree[name] = ('f', data)
         else:
             raise RuntimeError('Unsupported remote node: ' + path)
@@ -223,11 +224,21 @@ async def read_managed_books(afc):
 
 
 async def books_snapshot(afc, run):
-    existed, tree = await read_managed_books(afc)
+    # Books may write its sync files in the background: take two identical reads in a row.
+    state = await read_managed_books(afc)
+    for _ in range(10):
+        await asyncio.sleep(1)
+        again = await read_managed_books(afc)
+        if again == state:
+            break
+        state = again
+    else:
+        raise RuntimeError('Служебные файлы Books постоянно меняются: закройте приложение «Книги» '
+                           'на iPhone, дождитесь окончания загрузки книг и повторите.')
+    existed, tree = state
     write_tree_zip(run / 'books.zip', tree)
     top = sorted(await afc.listdir('Books')) if existed else []
     save_json(run / 'books.json', {'existed': existed, 'hash': tree_hash(tree), 'top': top})
-    require((await read_managed_books(afc)) == (existed, tree), 'Books changed before staging')
     return tree, existed
 
 
@@ -377,10 +388,12 @@ async def restore_books(afc, tree, existed, top=None):
     _, after = await read_managed_books(afc)
     managed = {p.removeprefix('Books/') for p in BOOK_FILES + BOOK_DIRS[1:]} | set(BOOK_LOCKS)
     tree = {n: v for n, v in tree.items() if n in managed}  # backups from older versions hold all of Books
-    diff = sorted(n for n in tree.keys() | after.keys() if tree.get(n) != after.get(n))
+    diff = ([f'+{n}' for n in sorted(after.keys() - tree.keys())] +
+            [f'-{n}' for n in sorted(tree.keys() - after.keys())] +
+            [f'~{n}' for n in sorted(tree.keys() & after.keys()) if tree[n] != after[n]])
     require(not diff, 'Не удалось вернуть служебные файлы Books на iPhone в исходное состояние. '
             'Копии сохранены в папке runs — не удаляйте её. Сообщите автору текст этой ошибки. '
-            'Отличаются: ' + ', '.join(diff[:10]))
+            'Отличаются (+ появилось, - пропало, ~ изменилось): ' + ', '.join(diff[:10]))
     if top is None:
         return []
     now = set(await afc.listdir('Books')) if await exists(afc, 'Books') else set()
@@ -531,6 +544,9 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
                     journal['books_restored'] = False
                     journal['books_restore_error'] = str(e)
                     save_json(run / 'journal.json', journal)
+                    if journal.get('complete'):
+                        raise RuntimeError('Каталог операторов записан и проверен, не удалось только вернуть '
+                                           'служебные файлы Books: ' + str(e)) from e
                     raise
                 save_json(run / 'journal.json', journal)
     # Remote originals and staging identifiers are intentionally retained for recovery.
@@ -608,8 +624,16 @@ async def install_trigger(device, path, run):
     watcher = asyncio.create_task(watch())
     try:
         await asyncio.wait_for(ready.wait(), 10)
-        async with Installer(device) as installer:
-            await asyncio.wait_for(installer.install_from_local(path), 90)
+        try:
+            async with Installer(device) as installer:
+                await asyncio.wait_for(installer.install_from_local(path), 90)
+        except Exception as error:
+            if 'InstallProhibited' in f'{type(error).__name__} {error}':
+                raise RuntimeError('iPhone запрещает установку (InstallProhibited). Проверьте «Настройки → '
+                                   'Экранное время → Ограничения контента и конфиденциальности → Покупки '
+                                   'в iTunes Store и App Store → Установка приложений: Да» и профили '
+                                   'управления (MDM). Ничего на телефоне не изменено.') from error
+            raise
         status['ipcc_installation_completed'] = True
         save_json(run / 'installation.json', status)
         await asyncio.sleep(8)
@@ -936,7 +960,9 @@ async def choose_device(udid, wait_seconds=180):
         if not announced:
             print('Ожидаю подключения iPhone по USB. Подключите и разблокируйте телефон…',flush=True)
             announced=True
-        require(time.monotonic()<deadline,'Время ожидания подключения истекло. Проверьте кабель и повторите.')
+        require(time.monotonic()<deadline,'Время ожидания подключения истекло. Проверьте кабель и повторите.'+
+                (' Если iPhone виден в Проводнике, но не в iTunes, не установлен драйвер Apple Mobile '
+                 'Device USB: см. раздел «Windows не видит iPhone» в README.' if sys.platform=='win32' else ''))
         await asyncio.sleep(min(2,max(0,deadline-time.monotonic())))
 
 
@@ -1247,6 +1273,7 @@ async def execute(args,assets):
             print('Прежние настройки возвращены. Проверьте имя пакета (bundle.yaml или пункт 7) и повторите.',flush=True)
             return 2
         if unconfirmed:return 2
+        print('Books: служебные файлы синхронизации возвращены в исходное состояние'+books_summary(run)+'.',flush=True)
         print('Готово. Включите авиарежим на 15 секунд и проверьте связь. Работа 5G не проверялась.')
         return 0
     except BaseException as error:
@@ -1350,6 +1377,11 @@ def outstanding_assets(tree):
             finally: db.close()
         except sqlite3.Error:
             return None
+
+
+def books_summary(run):
+    changes = sorted({c for j in run.glob('*/journal.json') for c in read_json(j).get('books_other_changes', [])})
+    return ('; за время установки в корне Books изменилось: ' + ', '.join(changes[:10])) if changes else ''
 
 
 def run_details(run):

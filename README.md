@@ -102,6 +102,12 @@ default: Vodafone_hu
 /usr/bin/xattr -r -s -d com.apple.quarantine "$HOME/Downloads/CarrierSIM"
 ```
 
+**Windows не видит iPhone.** В «Проводнике» телефон есть (как `Apple iPhone`, видны фото), а iTunes и скрипт его не находят. Значит, не установлен драйвер Apple Mobile Device USB. Переустановка iTunes не всегда помогает. Скачайте драйвер «Apple Mobile Device USB Driver» из [Microsoft Update Catalog](https://www.catalog.update.microsoft.com/Search.aspx?q=Apple%20Mobile%20Device%20USB%20Driver), распакуйте `.cab` и в командной строке от администратора выполните `pnputil /add-driver usbaapl64.inf /install` из папки с распакованными файлами. Затем перезагрузите компьютер.
+
+**«iPhone запрещает установку (InstallProhibited)».** В «Экранном времени» запрещена установка приложений: «Настройки → Экранное время → Ограничения контента и конфиденциальности → Покупки в iTunes Store и App Store → Установка приложений» — поставьте «Да» на время установки. То же бывает у телефонов с профилем управления (MDM).
+
+**«Служебные файлы Books постоянно меняются».** Закройте приложение «Книги» на iPhone, дождитесь окончания загрузки книг и повторите.
+
 **«Скрипт не может работать из этой папки».** Скопируйте папку CarrierSIM в «Загрузки» и запустите оттуда.
 
 ## Для продвинутых
