@@ -353,7 +353,8 @@ def check_trigger(path, sims, target=BUNDLE):
     name = bundles.pop()
     inner = {n.removeprefix('Payload/'): v for n, v in tree.items() if n.startswith('Payload/')}
     info, carrier = bundle_info(inner, name)
-    require(name != target and info.get('CFBundleIdentifier') != 'com.apple.Viva_kw', 'Viva is not an independent trigger')
+    require(name != target, 'Триггер совпадает с устанавливаемым профилем '+target+'; нужен другой IPCC')
+    require(info.get('CFBundleIdentifier') != 'com.apple.Viva_kw', 'Viva is not an independent trigger')
     identifiers = carrier.get('SupportedSIMs', [])
     require(identifiers and all(isinstance(s, str) and re.fullmatch(r'\d{5,6}(?:_.*)?', s) for s in identifiers),
             'Unknown SupportedSIMs format in trigger')
