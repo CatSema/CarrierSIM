@@ -705,10 +705,28 @@ async def choose_device(udid, wait_seconds=180):
 async def ready_device(udid, wait_seconds):
     from pymobiledevice3 import exceptions as errors
     deadline=time.monotonic()+wait_seconds
-    last=None
+    last=None;asked=False
     while True:
         await choose_device(udid,max(0,deadline-time.monotonic()))
-        try:return await connect(udid)
+        try:
+            device=await connect(udid)
+            if not device.paired:
+                # No pair record on this computer: without pairing lockdown answers GetProhibited.
+                # pymobiledevice3 saves the new record to usbmuxd too, so Apple's AirTrafficHost can use it.
+                try:
+                    if not asked:
+                        print('На iPhone появится запрос «Доверять этому компьютеру?». '
+                              'Нажмите «Доверять» и введите код-пароль.',flush=True)
+                        asked=True
+                    await device.pair(timeout=max(1,deadline-time.monotonic()))
+                    require(await device.validate_pairing(),'Не удалось установить доверие с iPhone. Отключите кабель и повторите.')
+                except errors.UserDeniedPairingError:
+                    await device.close()
+                    raise RuntimeError('На iPhone выбрано «Не доверять». Отключите и снова подключите кабель, '
+                                       'затем нажмите «Доверять».') from None
+                except BaseException:
+                    await device.close();raise
+            return device
         except (OSError, errors.ConnectionTerminatedError, errors.PasswordRequiredError,
                 errors.NotPairedError, errors.PairingDialogResponsePendingError,
                 errors.ConnectionFailedError, errors.InvalidConnectionError) as error:
