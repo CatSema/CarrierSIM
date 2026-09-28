@@ -206,6 +206,43 @@ async def books_snapshot(afc, run):
         require(rel not in tree or tree[rel][0] == 'd', 'Unexpected Books directory')
     return tree, bool(node)
 
+
+# Book lists where AirTraffic registers synced items. A run whose Books cleanup failed (older
+# versions) leaves our fake items there; atc then treats the catalog item as already installed
+# (installOnly) and omits it from the manifest, so every later run fails. These entries are ours.
+BOOK_LISTS = ('Books/Books.plist', 'Books/Backup-Books.plist', 'Books/Sync/Books.plist')
+
+
+def ours(item):
+    pid = str(item.get('Persistent ID', '')) if isinstance(item, dict) else ''
+    return 'airlift-' in pid or pid.endswith('Library/Carrier Bundles/iPhone')
+
+
+async def purge_stale_books(afc, run):
+    removed = {}
+    for path in BOOK_LISTS:
+        node = await exists(afc, path)
+        if node is None or node['st_ifmt'] != 'S_IFREG':
+            continue
+        raw = await afc.get_file_contents(path)
+        try:
+            data = plistlib.loads(raw)
+        except Exception:
+            continue
+        items = data.get('Books') if isinstance(data, dict) else None
+        if not isinstance(items, list) or not any(ours(i) for i in items):
+            continue
+        (run / 'books-stale').mkdir(exist_ok=True)
+        (run / 'books-stale' / path.replace('/', '_')).write_bytes(raw)
+        data['Books'] = [i for i in items if not ours(i)]
+        fmt = plistlib.FMT_BINARY if raw.startswith(b'bplist') else plistlib.FMT_XML
+        clean = plistlib.dumps(data, fmt=fmt)
+        await afc.set_file_contents(path, clean)
+        require(await afc.get_file_contents(path) == clean, 'Не удалось очистить ' + path)
+        removed[path] = len(items) - len(data['Books'])
+    return removed
+
+
 async def restore_books(afc, tree, existed):
     for path in BOOK_FILES:
         rel = path.removeprefix('Books/')
@@ -299,6 +336,9 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
     async with AfcService(device) as afc:
         for path in (source, link, exported):
             require(await exists(afc, path) is None, 'Staging path collision')
+        stale = await purge_stale_books(afc, run)
+        if stale:
+            journal['stale_books_removed'] = stale; save_json(run / 'journal.json', journal)
         books, books_existed = await books_snapshot(afc, run)
         mutated = False
         try:
@@ -1150,12 +1190,15 @@ def run_details(run):
         try: j = read_json(journal)
         except Exception: continue
         line = f"фаза {j.get('phase')}, завершён {bool(j.get('complete'))}, Books восстановлен {j.get('books_restored')}"
+        if j.get('stale_books_removed'): line += f", удалены старые записи: {j['stale_books_removed']}"
         if j.get('operation_error'): line += f", ошибка: {j['operation_error']}"
         rows.append((f'Этап {stage.name}', line))
         try:
             b = read_json(stage/'books.json'); tree = read_tree_zip(stage/'books.zip')
             known = [n for n in (x.removeprefix('Books/') for x in BOOK_FILES + BOOK_DIRS[1:]) if n in tree]
             rows.append(('  Books до операции', f"{'был' if b.get('existed') else 'не было'}, объектов {len(tree)}, служебные: {', '.join(known) or 'нет'}"))
+            traces = sorted(n for n, (k, d) in tree.items() if k == 'f' and b'airlift' in d)
+            if traces: rows.append(('  Следы airlift в Books', ', '.join(traces)))
         except Exception:
             pass
         host = stage/'host.jsonl'
