@@ -378,6 +378,10 @@ async def restore_books(afc, tree, existed, top=None):
                 require(node['st_ifmt'] == 'S_IFREG' and node['st_size'] == 0,
                         'Unexpected generated Books lock; retain backup')
                 await afc.rm_single(path)
+    for path in BOOK_DIRS[1:]:
+        # A sync folder that existed before (possibly empty) but was removed during the session.
+        if path.removeprefix('Books/') in tree and await exists(afc, path) is None:
+            await afc.makedirs(path)
     for path in reversed(BOOK_DIRS):
         was_present = existed if path == 'Books' else path.removeprefix('Books/') in tree
         if not was_present and await exists(afc, path) and not await afc.listdir(path):
