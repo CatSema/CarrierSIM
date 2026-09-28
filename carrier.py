@@ -219,6 +219,7 @@ def ours(item):
 
 
 async def purge_stale_books(afc, run):
+    from pymobiledevice3.exceptions import AfcException
     removed = {}
     for path in BOOK_LISTS:
         node = await exists(afc, path)
@@ -237,7 +238,13 @@ async def purge_stale_books(afc, run):
         data['Books'] = [i for i in items if not ours(i)]
         fmt = plistlib.FMT_BINARY if raw.startswith(b'bplist') else plistlib.FMT_XML
         clean = plistlib.dumps(data, fmt=fmt)
-        await afc.set_file_contents(path, clean)
+        try:
+            await afc.set_file_contents(path, clean)
+        except AfcException as error:
+            # Some Books files are not writable over AFC (status 10, permission denied).
+            # An open that failed changed nothing; record it and clean the rest.
+            removed[path] = 'запись запрещена: ' + str(error)
+            continue
         require(await afc.get_file_contents(path) == clean, 'Не удалось очистить ' + path)
         removed[path] = len(items) - len(data['Books'])
     return removed
@@ -1271,6 +1278,10 @@ def print_diagnostics(error):
         try: rows += run_details(run)
         except Exception as e: rows.append(('Журналы', f'не прочитаны: {e}'))
     rows.append(('Ошибка', f'{type(error).__name__}: {error}'))
+    import traceback
+    frames = [f for f in traceback.extract_tb(error.__traceback__) if f.filename.endswith(('carrier.py', 'launch.py'))]
+    if frames:
+        rows.append(('Где', ' → '.join(f'{f.name}:{f.lineno}' for f in frames[-4:])))
     print('\n===== Данные для отладки: скопируйте этот блок автору =====', file=sys.stderr)
     for k, v in rows: print(f'{k}: {v}', file=sys.stderr)
     print('===== конец блока =====\n', file=sys.stderr, flush=True)
