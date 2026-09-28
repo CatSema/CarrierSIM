@@ -109,7 +109,7 @@ def menu():
     print('  Исследование, разработка и тесты — Vladimir B / vlw')
     print('  vlwwwwww@gmail.com')
     print('─' * 56)
-    print('  1  Установить профиль\n'
+    print('  1  Установить профиль (по bundle.yaml)\n'
           '  2  Посмотреть SIM и план установки\n'
           '  3  Проверить компьютер и файлы\n\n'
           '  4  Вернуть штатные профили (удалить IMSI-ссылки)\n'
@@ -133,7 +133,7 @@ def menu():
 def other_profile():
     print('\n  Имя системного пакета оператора на iPhone, как в /System/Library/Carrier Bundles/iPhone.\n'
           '  Например: O2_Germany, Swisscom_ch, Vodafone_hu. Регистр букв важен.\n'
-          '  Пустой ввод — вернуться в меню.')
+          '  Этот профиль заменит bundle.yaml для выбранных SIM. Пустой ввод — вернуться в меню.')
     while True:
         name = input('  Профиль: ').strip().removesuffix('.bundle')
         if not name: return False
