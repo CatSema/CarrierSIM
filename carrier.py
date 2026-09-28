@@ -14,6 +14,7 @@ import re
 import stat
 import struct
 import sys
+import tempfile
 import time
 import zipfile
 
@@ -1038,6 +1039,13 @@ def main():
     if args.check:
         print('Триггеры целы, библиотеки Apple доступны; пакеты будут взяты из системы iPhone. Подключений к телефону не было.');return 0
     args.runs=args.runs.resolve()
+    try:
+        args.runs.mkdir(parents=True,exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=args.runs,prefix='.write-test-'):pass
+    except OSError as error:
+        raise RuntimeError(f'Скрипт не может сохранить копии в папку: {args.runs}\n'
+                           'Что сделать: закройте это окно, скопируйте всю папку CarrierSIM '
+                           'в «Загрузки» и запустите оттуда.') from None
     print('Разблокируйте iPhone и подтвердите доверие компьютеру. Закройте синхронизацию Finder/iTunes.',flush=True)
     with operation_lock(args.runs):return asyncio.run(execute_with_retry(args,assets)) or 0
 

@@ -5,8 +5,20 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parent
+
+
+def check_writable():
+    # .venv and runs (backups, journals) are created next to the script.
+    try:
+        with tempfile.NamedTemporaryFile(dir=ROOT, prefix='.write-test-'):
+            pass
+    except OSError as error:
+        raise RuntimeError(f'Скрипт не может работать из этой папки: {ROOT}\n'
+                           'Что сделать: закройте это окно, скопируйте всю папку CarrierSIM '
+                           'в «Загрузки» и запустите оттуда.') from None
 
 
 def python_environment():
@@ -88,6 +100,7 @@ def other_profile():
 
 def main():
     os.chdir(ROOT)
+    check_writable()
     python = None
     if len(sys.argv) > 1:
         python = python_environment()
