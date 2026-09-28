@@ -47,7 +47,8 @@ def placeholder_wheel(directory, name, version):
 
 
 def install_dependencies(python, version):
-    pip = [str(python), '-m', 'pip', 'install', '--disable-pip-version-check']
+    # Prefer an older release with a wheel over building a newer one from source.
+    pip = [str(python), '-m', 'pip', 'install', '--disable-pip-version-check', '--prefer-binary']
     if version >= (3, 13):
         with tempfile.TemporaryDirectory() as directory:
             wheels = [placeholder_wheel(directory, n, v) for n, v in PLACEHOLDERS]
