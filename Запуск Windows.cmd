@@ -5,24 +5,30 @@ set "PYTHONUTF8=1"
 cd /d "%~dp0"
 if errorlevel 1 exit /b 1
 set "CARRIER_PY="
-for %%V in (3.12 3.11 3.13 3.14) do (
-    py -%%V -c "import sys; assert sys.version_info >= (3,11) and sys.maxsize > 2**32" >nul 2>&1
-    if not errorlevel 1 (
-        set "CARRIER_PY=py -%%V"
-        goto run
-    )
-)
-py -3 -c "import sys; assert sys.version_info >= (3,11) and sys.maxsize > 2**32" >nul 2>&1
+set "CARRIER_CHECK=import sys; assert sys.version_info >= (3,11) and sys.maxsize > 2**32"
+rem Never ask py.exe for a specific version: the Python install manager (py install)
+rem reports a missing version on the console and may stop this script.
+rem "call" also keeps control here if py/python is a .bat shim (pyenv-win and similar).
+call py -c "%CARRIER_CHECK%" >nul 2>&1
 if not errorlevel 1 (
-    set "CARRIER_PY=py -3"
+    set "CARRIER_PY=py"
     goto run
 )
-python -c "import sys; assert sys.version_info >= (3,11) and sys.maxsize > 2**32" >nul 2>&1
+call python -c "%CARRIER_CHECK%" >nul 2>&1
 if not errorlevel 1 (
     set "CARRIER_PY=python"
     goto run
 )
-echo Установите Python 3.11 или новее, x64: https://www.python.org/downloads/windows/
+for /d %%D in ("%LOCALAPPDATA%\Python\pythoncore-3*" "%LOCALAPPDATA%\Programs\Python\Python3*" "%ProgramFiles%\Python3*") do (
+    if exist "%%~D\python.exe" (
+        "%%~D\python.exe" -c "%CARRIER_CHECK%" >nul 2>&1
+        if not errorlevel 1 (
+            set "CARRIER_PY="%%~D\python.exe""
+            goto run
+        )
+    )
+)
+echo Не найден Python 3.11 или новее, x64. Установите его: https://www.python.org/downloads/windows/
 set "CARRIER_STATUS=1"
 goto finish
 :run
