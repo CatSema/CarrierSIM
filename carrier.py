@@ -237,6 +237,48 @@ async def restore_books(afc, tree, existed):
             'Копии сохранены в папке runs — не удаляйте её. Сообщите автору текст этой ошибки. '
             'Отличаются: ' + ', '.join(diff[:10]))
 
+
+# Device-side view of an AirTraffic session: atc decides which assets enter the manifest.
+DEVICE_LOG_KEYS = ('atc', 'airtraffic', 'book', 'sandbox', 'deny', 'airlift', 'carrier bundles',
+                   'itunes', 'medialibrary', 'mobile.lockdown')
+
+
+@contextlib.asynccontextmanager
+async def device_log(device, path):
+    from pymobiledevice3.services.syslog import SyslogService
+    ready = asyncio.Event()
+    async def watch():
+        try:
+            async with SyslogService(device) as log:
+                ready.set()
+                size = 0
+                with path.open('w', encoding='utf-8') as f:
+                    async for row in log.watch():
+                        line = row.decode(errors='replace') if isinstance(row, bytes) else row
+                        low = line.lower()
+                        if any(k in low for k in DEVICE_LOG_KEYS):
+                            size += len(line)
+                            if size > 16 * 1024 * 1024: break
+                            f.write(line + '\n'); f.flush()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            with contextlib.suppress(Exception):
+                with path.open('a', encoding='utf-8') as f: f.write('LOG ERROR: ' + repr(error) + '\n')
+        finally:
+            ready.set()
+    task = asyncio.create_task(watch())
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(ready.wait(), 10)
+    try:
+        yield
+    finally:
+        await asyncio.sleep(1)  # let the phone flush the last lines
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 async def transfer(device, run, payload=None, expected=None, recovery=False):
     from pymobiledevice3.services.afc import AfcService
     run.mkdir(parents=True, exist_ok=False)
@@ -307,7 +349,8 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
                 require(await remote_tree(afc, exported) == snapshot, 'Export changed after backup')
                 phase('final-authorized')
             phase('host-started')
-            await host_session(device.udid, assets, pause, run)
+            async with device_log(device, run / 'device.log'):
+                await host_session(device.udid, assets, pause, run)
             for _ in range(30):
                 if await exists(afc, final_source) is None:
                     break
@@ -541,6 +584,9 @@ def native_host(udid, assets, directories):
                 if not msg: continue
                 try:
                     name = host.decode(host.at.ATCFMessageGetName(msg))
+                    try: body = json.dumps(host.decode(msg), ensure_ascii=False, default=str)[:4000]
+                    except Exception as e: body = 'не прочитано: ' + str(e)
+                    framed({'event': 'message', 'name': name, 'body': body})
                     if name == wanted:
                         if name != 'AssetManifest': return True
                         key = host.encode('AssetManifest')
@@ -610,7 +656,7 @@ async def host_session(udid, assets, callback, run):
                         require(not paused, 'Повторная пауза AirTraffic')
                         await callback(); paused = True
                         proc.stdin.write(b'CONTINUE\n'); await proc.stdin.drain()
-                    else: result = row
+                    elif 'ok' in row: result = row
                 code = await proc.wait()
         detail = (result or {}).get('error') or ('код ' + str(code))
         require(code == 0 and paused and result and result.get('ok'), 'Сбой AirTraffic: ' + str(detail))
@@ -1128,6 +1174,22 @@ def run_details(run):
                         rows.append(('    Book', ', '.join(f'{k}={v[:60]}' for k, v in x.items())))
                 elif row.get('ok') is False:
                     rows.append(('  Ошибка AirTraffic', str(row.get('error'))))
+        if host.exists():
+            names = []
+            for raw in host.read_text(encoding='utf-8', errors='replace').splitlines():
+                if raw.startswith('CARRIER_SWAP_JSON:'):
+                    with contextlib.suppress(ValueError):
+                        row = json.loads(raw.split(':', 1)[1])
+                        if row.get('event') == 'message': names.append(row.get('name'))
+            if names: rows.append(('  Сообщения AirTraffic', ' → '.join(map(str, names))))
+        dlog = stage/'device.log'
+        if dlog.exists():
+            lines = dlog.read_text(encoding='utf-8', errors='replace').splitlines()
+            key = [l for l in lines if any(k in l.lower() for k in
+                   ('deny', 'error', 'fail', 'airlift', 'carrier bundles', 'not found', 'no such', 'reject', 'skip', 'invalid'))]
+            rows.append(('  Журнал iPhone', f'{len(lines)} строк, важных {len(key)}'))
+            for l in key[-25:]:
+                rows.append(('    iPhone', re.sub(r'^\w{3} +\d+ [\d:]+ \S+ ', '', l.strip())[:300]))
         err = stage/'host.stderr'
         if err.exists():
             tail = [l.strip()[:200] for l in err.read_text(encoding='utf-8', errors='replace').splitlines() if l.strip()][-5:]
