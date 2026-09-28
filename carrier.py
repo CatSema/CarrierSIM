@@ -605,8 +605,8 @@ async def host_session(udid, assets, callback, run):
                         proc.stdin.write(b'CONTINUE\n'); await proc.stdin.drain()
                     else: result = row
                 code = await proc.wait()
-        require(code == 0 and paused and result and result.get('ok'),
-                'Сбой AirTraffic. Не удаляйте папку runs и '+recover_hint()+'.')
+        detail = (result or {}).get('error') or ('код ' + str(code))
+        require(code == 0 and paused and result and result.get('ok'), 'Сбой AirTraffic: ' + str(detail))
     finally:
         if proc.returncode is None:
             proc.kill(); await proc.wait()
@@ -756,15 +756,16 @@ async def execute_with_retry(args,assets):
             if not transient_error(error):raise
             failed=pending(args.runs,args.udid)
             if failed:
-                print('Связь прервалась. Сначала восстанавливаю незавершённый этап…',flush=True)
-                require(len(failed)==1,'Найдено несколько незавершённых операций; автоматически их не восстановить. Сообщите автору.')
+                print('Сбой во время записи. Сначала возвращаю iPhone в исходное состояние…',flush=True)
                 device=await ready_device(args.udid,args.wait_seconds)
                 recovery=args.runs/(datetime.now().strftime('%Y%m%d-%H%M%S-')+'auto-recovery-'+uuid.uuid4().hex[:6])
                 recovery.mkdir(mode=0o700)
                 try:
-                    await recover_stage(device,failed[0],recovery)
+                    await recover_all(device,failed,recovery)
+                    print('iPhone возвращён в исходное состояние.',flush=True)
                 except BaseException:
-                    print('Автовосстановление не завершено. Новая запись отменена. Журнал:',recovery,flush=True)
+                    print('Автовосстановление не завершено. Журнал:',recovery,flush=True)
+                    print('Не удаляйте папку runs и '+recover_hint()+'.',flush=True)
                     raise
                 finally:await device.close()
             if attempt==args.attempts:raise
@@ -793,7 +794,9 @@ def read_json(path):
 
 
 def pending(runs, udid):
-    return [p.parent for p in runs.glob('*/*/journal.json')
+    # Oldest first: run folders start with a timestamp; stages inside one run by journal age.
+    journals = sorted(runs.glob('*/*/journal.json'), key=lambda p: (p.parent.parent.name, p.stat().st_mtime))
+    return [p.parent for p in journals
             if (j:=read_json(p)).get('udid_hash')==digest(udid.encode())
             and (j.get('requires_recovery') or j.get('books_restored') is False) and not j.get('recovered_by')]
 
@@ -820,7 +823,7 @@ def bound(record,device):
             'Копия относится к другому телефону или каталогу.')
 
 
-async def recover_stage(device, failed, run):
+async def recover_stage(device, failed, run, tag=''):
     from pymobiledevice3.services.afc import AfcService
     record = read_json(failed/'journal.json'); bound(record,device)
     remote = record.get('exported','')
@@ -843,20 +846,26 @@ async def recover_stage(device, failed, run):
             desired = read_tree_zip(failed/'original.zip')
             require(tree_hash(desired)==record.get('original_hash'),'Локальная копия повреждена.')
         else:
+            # No exported copy on the phone and none saved locally: the catalog was never moved
+            # out, and the final asset is only sent after the backup is saved. Only the staging
+            # files in /var/mobile/Media changed, so undo those without another AirTraffic session.
             require(record.get('phase') in ('created','staging','host-started','export-check'),
                     'Нет проверенной копии. Сохраните runs; восстановление остановлено.')
         await restore_books(afc,books,state['existed'])
     if desired is not None:
-        write_tree_zip(run/'recovery-original.zip',desired)
-        await transfer(device,run/'recover',payload=desired,recovery=True)
-        observed=await transfer(device,run/'readback')
+        write_tree_zip(run/f'recovery-original{tag}.zip',desired)
+        await transfer(device,run/f'recover{tag}',payload=desired,recovery=True)
+        observed=await transfer(device,run/f'readback{tag}')
         require(observed==desired,'Восстановленный каталог не совпадает с копией.')
-    else:
-        # Before the controller saved a backup, final placement was never authorised.
-        # Export and return the still-live catalog; do not guess a replacement.
-        await transfer(device,run/'recover-live')
-    record['recovered_by']=str(run);record['requires_recovery']=False
+    record['recovered_by']=str(run);record['requires_recovery']=False;record['books_restored']=True
     save_json(failed/'journal.json',record)
+
+
+async def recover_all(device, stages, run):
+    # Undo newest first: a failed recovery attempt is itself a stage on top of the one it repaired.
+    for i,failed in enumerate(reversed(stages),1):
+        print('Восстанавливаю этап:',failed,flush=True)
+        await recover_stage(device,failed,run,f'-{i}' if len(stages)>1 else '')
 
 
 def check_trigger_hardware(path, hardware):
@@ -904,9 +913,8 @@ async def execute(args,assets):
         if args.recover == Path('AUTO'):
             if not unresolved:
                 print('Незавершённых операций для этого iPhone нет, восстанавливать нечего.');return 0
-            require(len(unresolved)==1,'Найдено несколько незавершённых операций; автоматически их не восстановить. Сообщите автору.')
-            args.recover=unresolved[0]
-        require(not unresolved or (args.recover and all(p.resolve()==args.recover.resolve() for p in unresolved)),
+            args.recover=unresolved
+        require(not unresolved or args.recover,
                 'Прошлая операция на этом iPhone не завершилась. Сначала '+recover_hint()+
                 ', затем повторите действие. Этап: '+str(unresolved[0] if unresolved else ''))
         run=args.runs/(datetime.now().strftime('%Y%m%d-%H%M%S-')+uuid.uuid4().hex[:6])
@@ -928,7 +936,8 @@ async def execute(args,assets):
             check_trigger(trigger,plmns,args.bundle);check_trigger_hardware(trigger,info['HardwareModel'])
         require(trigger is not None,'Не найден независимый триггер для этих SIM.')
         if args.recover:
-            await recover_stage(device,args.recover.resolve(),run)
+            if isinstance(args.recover,list):await recover_all(device,args.recover,run)
+            else:await recover_stage(device,args.recover.resolve(),run)
         elif args.restore:
             print('[1/4] Подготавливаю пересканирование…',flush=True)
             init=run/'initialize';init.mkdir();await install_trigger(device,trigger,init)
@@ -998,9 +1007,10 @@ async def execute(args,assets):
             save_json(run/'error.json',{'error':type(error).__name__+': '+str(error)})
             print('Операция остановлена. Журнал:',run,file=sys.stderr)
             unresolved=pending(args.runs,udid)
-            if unresolved and not args.recover:
+            if unresolved and not args.recover and not transient_error(error):
                 print('Чтобы вернуть iPhone в исходное состояние, '+recover_hint()+'.',file=sys.stderr)
-            for p in unresolved:print('Незавершённый этап: "'+str(p)+'"',file=sys.stderr)
+            if not transient_error(error):
+                for p in unresolved:print('Незавершённый этап: "'+str(p)+'"',file=sys.stderr)
         raise
     finally:await device.close()
 
