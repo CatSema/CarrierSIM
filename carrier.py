@@ -161,7 +161,8 @@ async def remote_tree(afc, root):
     total = 0
     async def visit(path, name='', depth=0):
         nonlocal total
-        require(depth < 32 and len(tree) < MAX_NODES, 'Remote tree limit')
+        require(depth < 32, 'Слишком глубокая вложенность папок: ' + path)
+        require(len(tree) < MAX_NODES, f'Больше {MAX_NODES} объектов в {root}: лимит скрипта')
         before = await afc.stat(path)
         kind = before['st_ifmt']
         if kind == 'S_IFDIR':
@@ -176,10 +177,12 @@ async def remote_tree(afc, root):
             require(name, 'Root is a symlink')
             tree[name] = ('l', before['LinkTarget'].encode())
         elif kind == 'S_IFREG':
-            require(name and before['st_size'] <= MAX_BYTES, 'Remote file limit')
+            require(name, 'Root is a file')
+            require(before['st_size'] <= MAX_BYTES, f'Файл больше {MAX_BYTES >> 20} МБ: {path}')
             data = await afc.get_file_contents(path)
+            require(len(data) == before['st_size'], 'Файл изменился во время чтения: ' + path)
             total += len(data)
-            require(total <= MAX_BYTES and len(data) == before['st_size'], 'Remote size mismatch')
+            require(total <= MAX_BYTES, f'В {root} больше {MAX_BYTES >> 20} МБ данных: лимит скрипта')
             tree[name] = ('f', data)
         else:
             raise RuntimeError('Unsupported remote node: ' + path)
@@ -190,21 +193,42 @@ async def remote_tree(afc, root):
     validate_tree(tree)
     return tree
 
-async def books_snapshot(afc, run):
-    # Preserve the entire Books tree, but only restore known sync artifacts automatically.
+BOOK_LOCKS = ('Managed/.Managed.plist.lock', 'Sync/.bookSync.lock')
+
+
+async def read_managed_books(afc):
+    # Only what this script touches in Books: AirTraffic's sync files and folders. The user's
+    # library (hundreds of MB of books, Purchases, MetadataStore) is never read or copied.
     node = await exists(afc, 'Books')
-    tree = await remote_tree(afc, 'Books') if node else {}
-    write_tree_zip(run / 'books.zip', tree)
-    state = {'existed': bool(node), 'hash': tree_hash(tree)}
-    save_json(run / 'books.json', state)
-    require(tree == (await remote_tree(afc, 'Books') if node else {}), 'Books changed before staging')
-    for path in BOOK_FILES:
-        rel = path.removeprefix('Books/')
-        require(rel not in tree or tree[rel][0] == 'f', 'Unexpected Books sync artifact')
+    if node is None:
+        return False, {}
+    require(node['st_ifmt'] == 'S_IFDIR', 'Books is not a directory')
+    tree = {}
     for path in BOOK_DIRS[1:]:
-        rel = path.removeprefix('Books/')
-        require(rel not in tree or tree[rel][0] == 'd', 'Unexpected Books directory')
-    return tree, bool(node)
+        found = await exists(afc, path)
+        if found is not None:
+            require(found['st_ifmt'] == 'S_IFDIR', 'Unexpected Books directory: ' + path)
+            tree[path.removeprefix('Books/')] = ('d', b'')
+    for path in list(BOOK_FILES) + ['Books/' + rel for rel in BOOK_LOCKS]:
+        found = await exists(afc, path)
+        if found is None:
+            continue
+        require(found['st_ifmt'] == 'S_IFREG', 'Unexpected Books sync artifact: ' + path)
+        require(found['st_size'] <= MAX_BYTES, f'Файл больше {MAX_BYTES >> 20} МБ: {path}')
+        data = await afc.get_file_contents(path)
+        require(len(data) == found['st_size'], 'Файл изменился во время чтения: ' + path)
+        tree[path.removeprefix('Books/')] = ('f', data)
+    validate_tree(tree)
+    return True, tree
+
+
+async def books_snapshot(afc, run):
+    existed, tree = await read_managed_books(afc)
+    write_tree_zip(run / 'books.zip', tree)
+    top = sorted(await afc.listdir('Books')) if existed else []
+    save_json(run / 'books.json', {'existed': existed, 'hash': tree_hash(tree), 'top': top})
+    require((await read_managed_books(afc)) == (existed, tree), 'Books changed before staging')
+    return tree, existed
 
 
 # Book lists where AirTraffic registers synced items. A run whose Books cleanup failed (older
@@ -322,7 +346,7 @@ async def clean_phone(device, run):
     return report
 
 
-async def restore_books(afc, tree, existed):
+async def restore_books(afc, tree, existed, top=None):
     for path in BOOK_FILES:
         rel = path.removeprefix('Books/')
         current = await exists(afc, path)
@@ -335,7 +359,7 @@ async def restore_books(afc, tree, existed):
             await afc.rm_single(path)
     # AirTraffic created these empty lock files during the first physical test.
     # Never delete a pre-existing lock or one with unexpected contents/type.
-    for rel in ('Managed/.Managed.plist.lock', 'Sync/.bookSync.lock'):
+    for rel in BOOK_LOCKS:
         if rel not in tree:
             path = 'Books/' + rel
             node = await exists(afc, path)
@@ -347,19 +371,20 @@ async def restore_books(afc, tree, existed):
         was_present = existed if path == 'Books' else path.removeprefix('Books/') in tree
         if not was_present and await exists(afc, path) and not await afc.listdir(path):
             await afc.rm_single(path)
-    after = await remote_tree(afc, 'Books') if await exists(afc, 'Books') else {}
     # Only files and folders this function restores must match the backup. The rest of Books
     # (Purchases, MetadataStore, the user's books) may be rewritten by iOS during the session;
-    # it cannot be put back from here, so a difference there is reported, not treated as failure.
-    files = {p.removeprefix('Books/') for p in BOOK_FILES} | {'Managed/.Managed.plist.lock', 'Sync/.bookSync.lock'}
-    folders = {p.removeprefix('Books/') for p in BOOK_DIRS[1:]}
-    diff = sorted([n for n in files if tree.get(n) != after.get(n)] +
-                  [n for n in folders if (n in tree) != (n in after)])
+    # it cannot be put back from here, so a top-level difference is reported, not a failure.
+    _, after = await read_managed_books(afc)
+    managed = {p.removeprefix('Books/') for p in BOOK_FILES + BOOK_DIRS[1:]} | set(BOOK_LOCKS)
+    tree = {n: v for n, v in tree.items() if n in managed}  # backups from older versions hold all of Books
+    diff = sorted(n for n in tree.keys() | after.keys() if tree.get(n) != after.get(n))
     require(not diff, 'Не удалось вернуть служебные файлы Books на iPhone в исходное состояние. '
             'Копии сохранены в папке runs — не удаляйте её. Сообщите автору текст этой ошибки. '
             'Отличаются: ' + ', '.join(diff[:10]))
-    return sorted(n for n in tree.keys() | after.keys()
-                  if n not in files and n not in folders and tree.get(n) != after.get(n))
+    if top is None:
+        return []
+    now = set(await afc.listdir('Books')) if await exists(afc, 'Books') else set()
+    return sorted('+' + n for n in now - set(top)) + sorted('-' + n for n in set(top) - now)
 
 
 # Device-side view of an AirTraffic session: atc decides which assets enter the manifest.
@@ -434,6 +459,7 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
         if stale:
             journal['stale_books_removed'] = stale; save_json(run / 'journal.json', journal)
         books, books_existed = await books_snapshot(afc, run)
+        books_top = read_json(run / 'books.json')['top']
         mutated = False
         try:
             raw = staging_archive(payload)
@@ -498,7 +524,7 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
         finally:
             if mutated:
                 try:
-                    other = await restore_books(afc, books, books_existed)
+                    other = await restore_books(afc, books, books_existed, books_top)
                     journal['books_restored'] = True
                     if other: journal['books_other_changes'] = other[:50]
                 except Exception as e:
@@ -1047,7 +1073,7 @@ async def recover_stage(device, failed, run, tag=''):
     async with AfcService(device) as afc:
         if record.get('complete'):
             # The carrier stage finished; only the Books cleanup failed. Never roll back the catalog.
-            if (other:=await restore_books(afc,books,state['existed'])):record['books_other_changes']=other[:50]
+            if (other:=await restore_books(afc,books,state['existed'],state.get('top'))):record['books_other_changes']=other[:50]
             record['recovered_by']=str(run);record['books_restored']=True
             save_json(failed/'journal.json',record)
             return
@@ -1064,7 +1090,7 @@ async def recover_stage(device, failed, run, tag=''):
             # files in /var/mobile/Media changed, so undo those without another AirTraffic session.
             require(record.get('phase') in ('created','staging','host-started','export-check'),
                     'Нет проверенной копии. Сохраните runs; восстановление остановлено.')
-        if (other:=await restore_books(afc,books,state['existed'])):record['books_other_changes']=other[:50]
+        if (other:=await restore_books(afc,books,state['existed'],state.get('top'))):record['books_other_changes']=other[:50]
     if desired is not None:
         write_tree_zip(run/f'recovery-original{tag}.zip',desired)
         await transfer(device,run/f'recover{tag}',payload=desired,recovery=True)
@@ -1343,7 +1369,8 @@ def run_details(run):
         try:
             b = read_json(stage/'books.json'); tree = read_tree_zip(stage/'books.zip')
             known = [n for n in (x.removeprefix('Books/') for x in BOOK_FILES + BOOK_DIRS[1:]) if n in tree]
-            rows.append(('  Books до операции', f"{'был' if b.get('existed') else 'не было'}, объектов {len(tree)}, служебные: {', '.join(known) or 'нет'}"))
+            rows.append(('  Books до операции', f"{'был' if b.get('existed') else 'не было'}, служебные: {', '.join(known) or 'нет'}"
+                         + (f", в корне: {', '.join(b['top'][:15])}" if b.get('top') else '')))
             outstanding = outstanding_assets(tree)
             if outstanding is not None:
                 mine = [x for x in outstanding if 'airlift-' in (x[0] or '') or (x[0] or '').endswith('Carrier Bundles/iPhone')]
