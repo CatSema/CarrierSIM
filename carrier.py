@@ -1028,7 +1028,7 @@ async def execute_with_retry(args,assets):
                 print('Сбой во время записи. Сначала возвращаю iPhone в исходное состояние…',flush=True)
                 device=await ready_device(args.udid,args.wait_seconds)
                 recovery=args.runs/(datetime.now().strftime('%Y%m%d-%H%M%S-')+'auto-recovery-'+uuid.uuid4().hex[:6])
-                recovery.mkdir(mode=0o700)
+                recovery.mkdir(mode=0o700); save_environment(recovery)
                 try:
                     await recover_all(device,failed,recovery)
                     print('iPhone возвращён в исходное состояние.',flush=True)
@@ -1187,7 +1187,7 @@ async def execute(args,assets):
                 'Прошлая операция на этом iPhone не завершилась. Сначала '+recover_hint()+
                 ', затем повторите действие. Этап: '+str(unresolved[0] if unresolved else ''))
         run=args.runs/(datetime.now().strftime('%Y%m%d-%H%M%S-')+uuid.uuid4().hex[:6])
-        run.mkdir(mode=0o700); DIAG['run']=run
+        run.mkdir(mode=0o700); DIAG['run']=run; save_environment(run)
         print('Копии и журнал:',run,flush=True)
         print('Идёт установка или восстановление, ожидайте… Не отключайте iPhone.',flush=True)
         save_json(run/'device.json',{**info,'udid_hash':digest(udid.encode())})
@@ -1466,6 +1466,34 @@ def run_details(run):
     return rows
 
 
+
+class Tee:
+    # Mirrors the console into the session log so a runs folder carries everything shown.
+    def __init__(self, stream, log):
+        self.stream, self.log = stream, log
+    def write(self, data):
+        self.stream.write(data)
+        with contextlib.suppress(Exception): self.log.write(data); self.log.flush()
+        return len(data)
+    def flush(self):
+        self.stream.flush()
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def start_session_log(runs):
+    path = runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'session.log')
+    log = path.open('a', encoding='utf-8', buffering=1)
+    log.write(' '.join(['carrier.py'] + sys.argv[1:]) + '\n')
+    sys.stdout, sys.stderr = Tee(sys.stdout, log), Tee(sys.stderr, log)
+    DIAG['session_log'] = str(path)
+
+
+def save_environment(run):
+    with contextlib.suppress(Exception):
+        save_json(run / 'environment.json', dict(environment_info()))
+
+
 def print_diagnostics(error):
     rows = []
     try: rows += environment_info()
@@ -1492,9 +1520,14 @@ def print_diagnostics(error):
     frames = [f for f in traceback.extract_tb(error.__traceback__) if f.filename.endswith(('carrier.py', 'launch.py'))]
     if frames:
         rows.append(('Где', ' → '.join(f'{f.name}:{f.lineno}' for f in frames[-4:])))
+    if DIAG.get('session_log'): rows.append(('Журнал сеанса', DIAG['session_log']))
+    text = '\n'.join(f'{k}: {v}' for k, v in rows)
     print('\n===== Данные для отладки: скопируйте этот блок автору =====', file=sys.stderr)
-    for k, v in rows: print(f'{k}: {v}', file=sys.stderr)
+    print(text, file=sys.stderr)
     print('===== конец блока =====\n', file=sys.stderr, flush=True)
+    if run:
+        with contextlib.suppress(Exception):
+            (run / 'diagnostics.txt').write_text(text + '\n\n' + ''.join(traceback.format_exception(error)), encoding='utf-8')
 
 
 
@@ -1564,6 +1597,7 @@ def main():
         raise RuntimeError(f'Скрипт не может сохранить копии в папку: {args.runs}\n'
                            'Что сделать: закройте это окно, скопируйте всю папку CarrierSIM '
                            'в «Загрузки» и запустите оттуда.') from None
+    with contextlib.suppress(OSError):start_session_log(args.runs)
     print('Разблокируйте iPhone и подтвердите доверие компьютеру. Закройте синхронизацию Finder/iTunes.',flush=True)
     with operation_lock(args.runs):return asyncio.run(execute_with_retry(args,assets)) or 0
 
