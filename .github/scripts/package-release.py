@@ -1,7 +1,8 @@
-"""Package and verify the exact historical release tree, excluding .gitignore."""
+"""Package and verify the exact release tag tree, excluding hidden paths."""
 import hashlib
 import io
 import pathlib
+import re
 import subprocess
 import sys
 import zipfile
@@ -18,9 +19,15 @@ def git(*args):
     return subprocess.check_output(['git', *args])
 
 
+def hidden(name):
+    return any(part.startswith('.') for part in pathlib.PurePosixPath(name).parts)
+
+
 def package(tag, destination):
-    commit = COMMITS[tag]
+    if not re.fullmatch(r'v[1-9][0-9]*', tag):
+        raise ValueError(f'Invalid release tag: {tag}')
     actual = git('rev-parse', f'refs/tags/{tag}^{{commit}}').decode().strip()
+    commit = COMMITS.get(tag, actual)
     if actual != commit:
         raise ValueError(f'{tag} points to {actual}, expected {commit}')
     expected = {}
@@ -30,7 +37,7 @@ def package(tag, destination):
         metadata, raw_name = entry.split(b'\t', 1)
         mode, kind, oid = metadata.split()
         name = raw_name.decode('utf-8')
-        if pathlib.PurePosixPath(name).name == '.gitignore':
+        if hidden(name):
             continue
         if kind != b'blob':
             raise ValueError(f'Unsupported tree entry: {name}')
@@ -43,7 +50,7 @@ def package(tag, destination):
         with zipfile.ZipFile(archive_path, 'w') as archive:
             archive.comment = source.comment
             for entry in source.infolist():
-                if pathlib.PurePosixPath(entry.filename).name != '.gitignore':
+                if not hidden(entry.filename):
                     archive.writestr(entry, source.read(entry))
     with zipfile.ZipFile(archive_path) as archive:
         actual_files = {
