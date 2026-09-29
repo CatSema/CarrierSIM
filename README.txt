@@ -303,7 +303,7 @@ EVS
 Это только надпись, на связь она не влияет.
 
 МОДЕЛИ И iOS
-Работает на iPhone 12–18, включая модели Pro, Pro Max, Plus, Air и e,
+Работает на iPhone 12–18, включая модели mini, Pro, Pro Max, Plus, Air и e,
 с iOS 18–27, включая iOS 27.0.1 и 27.2 beta 2.
 
 Запуск не ограничен моделью iPhone, платой и версией iOS. На непроверенной
@@ -318,6 +318,14 @@ Apple из раздела iOS 27.0 официального каталога и 
 
 Неполный справочник известных моделей (не список разрешённых; неизвестная модель
 отображается по ProductType):
+- iPhone 12: iPhone13,2 / D53GAP
+- iPhone 12 mini: iPhone13,1 / D52GAP
+- iPhone 12 Pro: iPhone13,3 / D53PAP
+- iPhone 12 Pro Max: iPhone13,4 / D54PAP
+- iPhone 13: iPhone14,5 / D17AP
+- iPhone 13 mini: iPhone14,4 / D16AP
+- iPhone 13 Pro: iPhone14,2 / D63AP
+- iPhone 13 Pro Max: iPhone14,3 / D64AP
 - iPhone 14: iPhone14,7 / D27AP
 - iPhone 14 Plus: iPhone14,8 / D28AP
 - iPhone 14 Pro: iPhone15,2 / D73AP
