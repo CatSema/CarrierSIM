@@ -116,7 +116,7 @@ def python_environment():
     return python
 
 
-def menu():
+def menu(wifi=False):
     print('\n' + '─' * 56)
     print('  CarrierSIM  ·  Vodafone HU')
     print('  Один профиль для всех SIM · привязка по IMSI')
@@ -131,7 +131,8 @@ def menu():
           '  6  Открыть справку\n'
           '  7  Выбрать другой профиль\n'
           '  8  Диагностика связи (IMS, VoWiFi, VoLTE, 5G) — только чтение\n'
-          '  9  Проверка звонка (кодек, канал) — только чтение\n\n'
+          '  9  Проверка звонка (кодек, канал) — только чтение\n'
+          f'  10 Связь с iPhone: {"Wi-Fi (эксперимент)" if wifi else "кабель"} — переключить\n\n'
           '  0  Выход\n')
     while True:
         choice = input('  Ваш выбор: ').strip()
@@ -145,7 +146,8 @@ def menu():
         if choice == '7': return other_profile()
         if choice == '8': return ['--diagnose']
         if choice == '9': return ['--watch-call']
-        print('Введите число от 0 до 9. Установка ещё не начата.')
+        if choice == '10': return 'wifi'
+        print('Введите число от 0 до 10. Установка ещё не начата.')
 
 
 def other_profile():
@@ -178,10 +180,20 @@ def main():
     if len(sys.argv) > 1:
         python = python_environment()
         return run_carrier(python, sys.argv[1:])
+    wifi = False
     while True:
-        args = menu()
+        args = menu(wifi)
         if args is None: return 0
         if args is False: continue
+        if args == 'wifi':
+            wifi = not wifi
+            if wifi:
+                print('\n  Режим Wi-Fi: все действия с телефоном пойдут без кабеля.\n'
+                      '  Нужно заранее: доверие через кабель и в Finder/iTunes галка\n'
+                      '  «Показывать этот iPhone, если он подключён к Wi-Fi». Одна сеть с компьютером.\n'
+                      '  Сначала пункт 2, потом 1. Порядок проверки — в README, раздел про --wifi.')
+            continue
+        if wifi and args not in (['--check'], ['--help']): args = [*args, '--wifi']
         print('\n' + '─' * 56, flush=True)
         try:
             if python is None: python = python_environment()

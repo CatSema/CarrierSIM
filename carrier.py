@@ -32,6 +32,17 @@ BOOK_FILES = ('Books/Books.plist', 'Books/Sync/Books.plist', 'Books/Sync/Upload.
               'Books/Sync/Database/OutstandingAssets_4.sqlite-wal')
 BOOK_DIRS = ('Books', 'Books/Managed', 'Books/Sync', 'Books/Sync/Database')
 AFC_PERM_DENIED = 10  # pymobiledevice3 AfcError.PERM_DENIED
+# usbmux transport: 'USB' or 'Network' (Wi-Fi sync, set by --wifi).
+CONNECTION = 'USB'
+# Over the cable usbmuxd drops the socket as soon as the phone is gone; over Wi-Fi a sleeping
+# phone can leave AFC waiting for hours. A Wi-Fi transfer takes about 25 s, host_session caps
+# AirTraffic at 170 s. Recovery starts over a fresh connection and restores Books from books.zip.
+NETWORK_TRANSFER_SECONDS = 300
+NETWORK_BOOKS_SECONDS = 90
+
+
+def network_timeout(seconds):
+    return asyncio.timeout(seconds) if CONNECTION == 'Network' else contextlib.nullcontext()
 
 
 
@@ -524,7 +535,7 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
         save_json(run / 'journal.json', journal)
     phase('created')
     snapshot = None
-    async with AfcService(device) as afc:
+    async with network_timeout(NETWORK_TRANSFER_SECONDS), AfcService(device) as afc:
         for path in (source, link, exported):
             require(await exists(afc, path) is None, 'Staging path collision')
         leftovers = sorted(n for n in await afc.listdir('/') if n.startswith('airlift-'))
@@ -601,7 +612,9 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
         finally:
             if mutated:
                 try:
-                    other = await restore_books(afc, books, books_existed, books_top)
+                    # Its own limit: the transfer timeout may already have fired on a dead connection.
+                    async with network_timeout(NETWORK_BOOKS_SECONDS):
+                        other = await restore_books(afc, books, books_existed, books_top)
                     journal['books_restored'] = True
                     if other: journal['books_other_changes'] = other[:50]
                 except Exception as e:
@@ -618,7 +631,7 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
 
 async def connect(udid):
     from pymobiledevice3.lockdown import create_using_usbmux
-    return await asyncio.wait_for(create_using_usbmux(serial=udid, autopair=False, connection_type='USB'), 15)
+    return await asyncio.wait_for(create_using_usbmux(serial=udid, autopair=False, connection_type=CONNECTION), 15)
 
 async def device_info(device):
     result = {k: await device.get_value(key=k) for k in
@@ -1030,28 +1043,43 @@ async def choose_device(udid, wait_seconds=180):
     announced=False
     while True:
         try:
-            devices=[d.serial for d in await list_devices() if d.connection_type=='USB']
+            # One phone on Wi-Fi and Ethernet (or IPv4 and IPv6) is listed more than once.
+            devices=list(dict.fromkeys(d.serial for d in await list_devices() if d.connection_type==CONNECTION))
         except (OSError, ConnectionError, ConnectionFailedToUsbmuxdError, NoDeviceConnectedError):devices=[]
         if udid and udid in devices:return udid
         if not udid and len(devices)==1:return devices[0]
         require(udid or len(devices)<2,'Подключено несколько iPhone. Укажите --udid.')
         if not announced:
-            print('Ожидаю подключения iPhone по USB. Подключите и разблокируйте телефон…',flush=True)
+            print('Ожидаю iPhone по Wi-Fi. Телефон и компьютер должны быть в одной сети, iPhone разблокирован…'
+                  if CONNECTION=='Network' else 'Ожидаю подключения iPhone по USB. Подключите и разблокируйте телефон…',flush=True)
             announced=True
-        require(time.monotonic()<deadline,'Время ожидания подключения истекло. Проверьте кабель и повторите.'+
+        require(time.monotonic()<deadline,'Время ожидания подключения истекло. '+
+                ('iPhone не виден по Wi-Fi: один раз подключите его кабелем и включите в Finder/iTunes '
+                 '«Показывать этот iPhone, если он подключён к Wi-Fi», затем повторите с --wifi.' if CONNECTION=='Network' else
+                 'Проверьте кабель и повторите.')+
                 (' Если iPhone виден в Проводнике, но не в iTunes, не установлен драйвер Apple Mobile '
-                 'Device USB: см. раздел «Windows не видит iPhone» в README.' if sys.platform=='win32' else ''))
+                 'Device USB: см. раздел «Windows не видит iPhone» в README.' if sys.platform=='win32' and CONNECTION=='USB' else ''))
         await asyncio.sleep(min(2,max(0,deadline-time.monotonic())))
 
 
 async def ready_device(udid, wait_seconds):
     from pymobiledevice3 import exceptions as errors
     deadline=time.monotonic()+wait_seconds
-    last=None;asked=False
+    last=None;asked=False;unpaired=0
     while True:
         await choose_device(udid,max(0,deadline-time.monotonic()))
         try:
             device=await connect(udid)
+            if not device.paired and CONNECTION=='Network':
+                # Trust can only be granted over the cable; Wi-Fi reuses the existing pair record.
+                # A Wi-Fi drop during StartSession or TLS also reads as unpaired, so retry a few times.
+                await device.close()
+                unpaired+=1
+                require(unpaired<3 and time.monotonic()<deadline,
+                        'Нет доверия с этим компьютером. Подключите iPhone кабелем, запустите без --wifi '
+                        'и нажмите «Доверять», затем повторите с --wifi.')
+                await asyncio.sleep(2)
+                continue
             if not device.paired:
                 # No pair record on this computer: without pairing lockdown answers GetProhibited.
                 # pymobiledevice3 saves the new record to usbmuxd too, so Apple's AirTrafficHost can use it.
@@ -1072,7 +1100,8 @@ async def ready_device(udid, wait_seconds):
         except (OSError, errors.ConnectionTerminatedError, errors.PasswordRequiredError,
                 errors.NotPairedError, errors.PairingDialogResponsePendingError,
                 errors.ConnectionFailedError, errors.InvalidConnectionError) as error:
-            if last is None:print('Ожидаю разблокировки, доверия и готовности USB-соединения…',flush=True)
+            if last is None:print('Ожидаю разблокировки, доверия и готовности '+
+                                  ('соединения по Wi-Fi…' if CONNECTION=='Network' else 'USB-соединения…'),flush=True)
             last=error
             if time.monotonic()>=deadline:raise RuntimeError('iPhone не готов: разблокируйте и подтвердите доверие.') from error
             await asyncio.sleep(2)
@@ -1083,7 +1112,9 @@ def transient_error(error):
     if isinstance(error,(ConnectionError,TimeoutError,errors.ConnectionTerminatedError,
                          errors.ConnectionFailedError,errors.InvalidConnectionError)):
         return True
-    if isinstance(error,OSError) and error.errno in (32,54,60,104,110):return True
+    # Broken pipe, reset, timeout; network down/unreachable, host down/unreachable (macOS, then Windows).
+    if isinstance(error,OSError) and error.errno in (32,54,60,104,110,50,51,64,65,
+                                                     10050,10051,10054,10060,10064,10065):return True
     # The phone answering without our assets is deterministic: retrying only repeats it.
     return isinstance(error,RuntimeError) and any(t in str(error) for t in
         ('Сбой AirTraffic','Final source not consumed')) and 'не подтвердил нужные объекты' not in str(error)
@@ -1928,7 +1959,8 @@ def main():
     parser.add_argument('--attempts',type=int,default=3,metavar='N',help='попытки при временном сбое связи (по умолчанию 3)')
     parser.add_argument('--seconds',type=int,metavar='СЕК',help='длительность --diagnose (по умолчанию 90) или --watch-call (по умолчанию 180)')
     parser.add_argument('--wait-seconds',type=int,default=180,metavar='СЕК',help='ожидать подключение и разблокировку (по умолчанию 180 секунд)')
-    parser.add_argument('--udid',metavar='ID',help='выбрать iPhone, если по USB подключено несколько')
+    parser.add_argument('--udid',metavar='ID',help='выбрать iPhone, если подключено несколько')
+    parser.add_argument('--wifi',action='store_true',help='подключаться по Wi-Fi вместо кабеля (медленнее); нужны доверие и «Показывать iPhone при Wi-Fi», включённые заранее через кабель')
     parser.add_argument('--apple-dir',action='append',default=[],metavar='ПАПКА',help='Windows: папка DLL Apple; можно указать несколько раз')
     parser.add_argument('--runs',type=Path,default=ROOT/'runs',metavar='ПАПКА',help='куда сохранять копии и журналы (по умолчанию runs рядом со скриптом)')
     parser._optionals.title='Параметры'
@@ -1957,7 +1989,8 @@ def main():
         if not args.recover: raise
         print(f'Предупреждение: assets.zip недоступен ({error}). Восстановление пройдёт без пересканирования.',flush=True)
         assets=None
-    global APPLE_DIRS
+    global APPLE_DIRS, CONNECTION
+    if args.wifi: CONNECTION='Network'
     APPLE_DIRS=[str(Path(p).resolve()) for p in args.apple_dir]
     # No shell, no compiler, no native executable bundled with the archive.
     check=subprocess.run(host_command()+['check'],input=json.dumps({'directories':APPLE_DIRS}),
