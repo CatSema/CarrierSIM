@@ -25,7 +25,14 @@ jobs:
       fail-fast: false
       matrix:
         python: ['3.11', '3.12', '3.13', '3.14']
-        os: [ubuntu-latest, windows-latest, macos-15, macos-15-intel]
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-15
+          - macos-15-intel
+          - macos-26
+          - macos-26-intel
+          - xcode-27 # macOS 27, Apple Silicon; GitHub public preview image
     defaults:
       run:
         shell: bash
@@ -36,6 +43,8 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python }}
+      - name: Report actual OS, architecture and Python version
+        run: python -c "import platform, sys; print(platform.platform()); print(platform.machine()); print(sys.version)"
       - name: Install dependencies through the CarrierSIM launcher
         run: python -c "import launch, sys; sys.exit(0 if launch.install_dependencies(sys.executable, sys.version_info[:2]) else 1)"
       - name: Check installed dependencies and service imports
