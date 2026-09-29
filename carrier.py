@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from carriersim_version import VERSION
 
 ROOT = Path(__file__).resolve().parent
 
@@ -1722,7 +1723,8 @@ def sysctl(name):
 def environment_info():
     import platform
     from importlib.metadata import version, metadata, PackageNotFoundError
-    rows = [('Сборка скрипта', digest((ROOT/'carrier.py').read_bytes())[:12]),
+    rows = [('CarrierSIM', VERSION),
+            ('Сборка скрипта', digest((ROOT/'carrier.py').read_bytes())[:12]),
             ('Python', f"{sys.version.split()[0]} {platform.machine()} {'64' if sys.maxsize > 2**32 else '32'}-bit")]
     libs = []
     for name in ('pymobiledevice3', 'cryptography', 'pyimg4', 'pylzss', 'lzfse'):
@@ -1884,6 +1886,7 @@ class Tee:
 def start_session_log(runs):
     path = runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'session.log')
     log = path.open('a', encoding='utf-8', buffering=1)
+    log.write(f'CarrierSIM {VERSION} · сборка {digest((ROOT/"carrier.py").read_bytes())[:12]}\n')
     log.write(' '.join(['carrier.py'] + sys.argv[1:]) + '\n')
     sys.stdout, sys.stderr = Tee(sys.stdout, log), Tee(sys.stderr, log)
     DIAG['session_log'] = str(path)
@@ -1938,10 +1941,10 @@ def main():
             native_host(value.get('udid'),value.get('assets',[]),value.get('directories',[]))
             return 0
         except Exception as e:framed({'ok':False,'error':str(e)});return 1
-    print('Исследование, разработка и тесты — Vladimir B / vlw (vlwwwwww@gmail.com).',flush=True)
     parser=argparse.ArgumentParser(description='Vodafone_hu для всех SIM независимо от страны. '
         'Без флагов: установить по IMSI на SIM, сообщённые iPhone. Без ограничений по модели iPhone и версии iOS; совместимость не гарантируется.',
         add_help=False)
+    parser.add_argument('--version', action='version', version=f'CarrierSIM {VERSION}')
     parser.add_argument('-h','--help',action='help',help='показать эту справку')
     group=parser.add_mutually_exclusive_group()
     group.add_argument('--check',action='store_true',help='проверить файлы и библиотеки Apple, без подключения к телефону')
@@ -1965,6 +1968,8 @@ def main():
     parser.add_argument('--runs',type=Path,default=ROOT/'runs',metavar='ПАПКА',help='куда сохранять копии и журналы (по умолчанию runs рядом со скриптом)')
     parser._optionals.title='Параметры'
     args=parser.parse_args()
+    print(f'CarrierSIM {VERSION}',flush=True)
+    print('Исследование, разработка и тесты — Vladimir B / vlw (vlwwwwww@gmail.com).',flush=True)
     DIAG['args']=args
     if args.bundle:
         args.bundle=args.bundle.strip().removesuffix('.bundle')+'.bundle'
