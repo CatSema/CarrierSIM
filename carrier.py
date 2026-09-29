@@ -31,6 +31,7 @@ BOOK_FILES = ('Books/Books.plist', 'Books/Sync/Books.plist', 'Books/Sync/Upload.
               'Books/Sync/Database/OutstandingAssets_4.sqlite-shm',
               'Books/Sync/Database/OutstandingAssets_4.sqlite-wal')
 BOOK_DIRS = ('Books', 'Books/Managed', 'Books/Sync', 'Books/Sync/Database')
+AFC_PERM_DENIED = 10  # pymobiledevice3 AfcError.PERM_DENIED
 
 
 
@@ -248,9 +249,16 @@ async def books_snapshot(afc, run):
 BOOK_LISTS = ('Books/Books.plist', 'Books/Backup-Books.plist', 'Books/Sync/Books.plist')
 
 
+def our_trace(value):
+    # This script's asset IDs: unique airlift-* staging names or the catalog path they resolve to.
+    if isinstance(value, bytes):
+        return b'airlift-' in value or b'Carrier Bundles/iPhone' in value
+    value = str(value or '')
+    return 'airlift-' in value or value.endswith('Carrier Bundles/iPhone')
+
+
 def ours(item):
-    pid = str(item.get('Persistent ID', '')) if isinstance(item, dict) else ''
-    return 'airlift-' in pid or pid.endswith('Library/Carrier Bundles/iPhone')
+    return isinstance(item, dict) and our_trace(item.get('Persistent ID'))
 
 
 async def purge_stale_books(afc, run):
@@ -278,6 +286,9 @@ async def purge_stale_books(afc, run):
         except AfcException as error:
             # Some Books files are not writable over AFC (status 10, permission denied).
             # An open that failed changed nothing; record it and clean the rest.
+            # Any other AFC failure (no space, lost connection) must not pass as "denied".
+            if error.status != AFC_PERM_DENIED:
+                raise
             removed[path] = 'запись запрещена: ' + str(error)
             continue
         require(await afc.get_file_contents(path) == clean, 'Не удалось очистить ' + path)
@@ -301,6 +312,17 @@ async def remove_tree(afc, path):
     await afc.rm_single(path)
 
 
+def read_outstanding(files):
+    # OutstandingAssets_4.sqlite with its WAL, as {suffix: bytes}: rows (persistent ID, completed path).
+    # Raises sqlite3.Error when the database cannot be read.
+    import sqlite3
+    with tempfile.TemporaryDirectory() as d:
+        for suffix, data in files.items(): (Path(d)/('db.sqlite' + suffix)).write_bytes(data)
+        db = sqlite3.connect(Path(d)/'db.sqlite')
+        try: return db.execute('select ZPERSISTENTID, ZDOWNLOADCOMPLETEPATH from ZBCOUTSTANDINGASSET').fetchall()
+        finally: db.close()
+
+
 async def purge_outstanding(afc, run):
     # Books' queue of unfinished sync downloads. Rows of an interrupted run make atc skip the
     # catalog. Only when every row is ours is the database removed (Books recreates it empty).
@@ -311,15 +333,11 @@ async def purge_outstanding(afc, run):
             files[suffix] = await afc.get_file_contents(OUTSTANDING_DB + suffix)
     if '' not in files:
         return None
-    with tempfile.TemporaryDirectory() as d:
-        for suffix, data in files.items(): (Path(d)/('db.sqlite' + suffix)).write_bytes(data)
-        try:
-            db = sqlite3.connect(Path(d)/'db.sqlite')
-            try: rows = [r[0] or '' for r in db.execute('select ZPERSISTENTID from ZBCOUTSTANDINGASSET')]
-            finally: db.close()
-        except sqlite3.Error as error:
-            return 'не прочитана: ' + str(error)
-    mine = [x for x in rows if 'airlift-' in x or x.endswith('Carrier Bundles/iPhone')]
+    try:
+        rows = [r[0] or '' for r in read_outstanding(files)]
+    except sqlite3.Error as error:
+        return 'не прочитана: ' + str(error)
+    mine = [x for x in rows if our_trace(x)]
     if not mine:
         return 0
     if len(mine) != len(rows):
@@ -339,10 +357,18 @@ async def clean_phone(device, run):
         for name in sorted(n for n in await afc.listdir('/') if LEFTOVER.fullmatch(n)):
             node = await afc.stat(name)
             if name.startswith('airlift-saved-') and node['st_ifmt'] == 'S_IFDIR':
-                # An exported carrier catalog. Keep a local copy before removing it.
-                with contextlib.suppress(Exception):
+                # An exported carrier catalog, possibly the only copy of it (a run from another
+                # copy of the folder leaves no journal here). Removed only after a local copy
+                # is written and read back identical; otherwise it stays on the phone.
+                try:
+                    tree = await remote_tree(afc, name)
                     (run / 'media-leftovers').mkdir(exist_ok=True)
-                    write_tree_zip(run / 'media-leftovers' / (name + '.zip'), await remote_tree(afc, name))
+                    copy = run / 'media-leftovers' / (name + '.zip')
+                    write_tree_zip(copy, tree)
+                    require(read_tree_zip(copy) == tree, 'копия не совпала')
+                except Exception as error:
+                    report[name] = 'не удалён: локальная копия не сохранена: ' + str(error)
+                    continue
             try:
                 await remove_tree(afc, name)
                 report[name] = 'удалён'
@@ -357,17 +383,38 @@ async def clean_phone(device, run):
     return report
 
 
+async def books_change(afc, path, action, denied):
+    # Some Books files are not writable over AFC (status 10) although iOS itself rewrites them.
+    # Such a file is left as iOS made it, unless it still holds this script's staging entries.
+    from pymobiledevice3.exceptions import AfcException
+    try:
+        await action
+    except AfcException as error:
+        if error.status != AFC_PERM_DENIED:
+            raise
+        data = await afc.get_file_contents(path) if await exists(afc, path) else b''
+        require(not our_trace(data),
+                'iPhone запрещает изменить ' + path + ', а в нём остались записи скрипта. '
+                'Копии сохранены в папке runs — не удаляйте её. Сообщите автору текст этой ошибки.')
+        denied.add(path.removeprefix('Books/'))
+
+
 async def restore_books(afc, tree, existed, top=None):
+    denied = set()
     for path in BOOK_FILES:
         rel = path.removeprefix('Books/')
         current = await exists(afc, path)
         require(current is None or current['st_ifmt'] == 'S_IFREG', 'Unexpected Books artifact; keep backup')
         if rel in tree:
+            # An unchanged file is not opened for writing at all.
+            if current is not None and await afc.get_file_contents(path) == tree[rel][1]:
+                continue
             await afc.makedirs(str(PurePosixPath(path).parent))
-            await afc.set_file_contents(path, tree[rel][1])
-            require(await afc.get_file_contents(path) == tree[rel][1], 'Books restore mismatch')
+            await books_change(afc, path, afc.set_file_contents(path, tree[rel][1]), denied)
+            if rel not in denied:
+                require(await afc.get_file_contents(path) == tree[rel][1], 'Books restore mismatch')
         elif current:
-            await afc.rm_single(path)
+            await books_change(afc, path, afc.rm_single(path), denied)
     # AirTraffic created these empty lock files during the first physical test.
     # Never delete a pre-existing lock or one with unexpected contents/type.
     for rel in BOOK_LOCKS:
@@ -377,7 +424,7 @@ async def restore_books(afc, tree, existed, top=None):
             if node is not None:
                 require(node['st_ifmt'] == 'S_IFREG' and node['st_size'] == 0,
                         'Unexpected generated Books lock; retain backup')
-                await afc.rm_single(path)
+                await books_change(afc, path, afc.rm_single(path), denied)
     for path in BOOK_DIRS[1:]:
         # A sync folder that existed before (possibly empty) but was removed during the session.
         if path.removeprefix('Books/') in tree and await exists(afc, path) is None:
@@ -392,16 +439,20 @@ async def restore_books(afc, tree, existed, top=None):
     _, after = await read_managed_books(afc)
     managed = {p.removeprefix('Books/') for p in BOOK_FILES + BOOK_DIRS[1:]} | set(BOOK_LOCKS)
     tree = {n: v for n, v in tree.items() if n in managed}  # backups from older versions hold all of Books
+    # Files iOS does not let us write stay as iOS left them: reported, not a failure.
+    tree = {n: v for n, v in tree.items() if n not in denied}
+    after = {n: v for n, v in after.items() if n not in denied}
     diff = ([f'+{n}' for n in sorted(after.keys() - tree.keys())] +
             [f'-{n}' for n in sorted(tree.keys() - after.keys())] +
             [f'~{n}' for n in sorted(tree.keys() & after.keys()) if tree[n] != after[n]])
     require(not diff, 'Не удалось вернуть служебные файлы Books на iPhone в исходное состояние. '
             'Копии сохранены в папке runs — не удаляйте её. Сообщите автору текст этой ошибки. '
             'Отличаются (+ появилось, - пропало, ~ изменилось): ' + ', '.join(diff[:10]))
+    kept = sorted('!' + n + ' (запись запрещена iOS)' for n in denied)
     if top is None:
-        return []
+        return kept
     now = set(await afc.listdir('Books')) if await exists(afc, 'Books') else set()
-    return sorted('+' + n for n in now - set(top)) + sorted('-' + n for n in set(top) - now)
+    return kept + sorted('+' + n for n in now - set(top)) + sorted('-' + n for n in set(top) - now)
 
 
 # Device-side view of an AirTraffic session: atc decides which assets enter the manifest.
@@ -410,7 +461,9 @@ DEVICE_LOG_KEYS = ('atc', 'airtraffic', 'book', 'sandbox', 'deny', 'airlift', 'c
 
 
 @contextlib.asynccontextmanager
-async def device_log(device, path):
+async def syslog_capture(device, path, keep, status=None, linger=1):
+    # Diagnostics only: a slow, broken or overflowing syslog never fails the operation.
+    # Its error goes into the log file and, when given, status['log_error'].
     from pymobiledevice3.services.syslog import SyslogService
     ready = asyncio.Event()
     async def watch():
@@ -421,14 +474,15 @@ async def device_log(device, path):
                 with path.open('w', encoding='utf-8') as f:
                     async for row in log.watch():
                         line = row.decode(errors='replace') if isinstance(row, bytes) else row
-                        low = line.lower()
-                        if any(k in low for k in DEVICE_LOG_KEYS):
+                        if keep(line):
                             size += len(line)
-                            if size > 16 * 1024 * 1024: break
+                            require(size <= 16 * 1024 * 1024, 'Log limit reached')
                             f.write(line + '\n'); f.flush()
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            if status is not None:
+                status['log_error'] = type(error).__name__ + ': ' + str(error)
             with contextlib.suppress(Exception):
                 with path.open('a', encoding='utf-8') as f: f.write('LOG ERROR: ' + repr(error) + '\n')
         finally:
@@ -439,10 +493,14 @@ async def device_log(device, path):
     try:
         yield
     finally:
-        await asyncio.sleep(1)  # let the phone flush the last lines
+        await asyncio.sleep(linger)  # let the phone flush the last lines
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+def device_log(device, path):
+    return syslog_capture(device, path, lambda line: any(k in line.lower() for k in DEVICE_LOG_KEYS))
 
 
 async def transfer(device, run, payload=None, expected=None, recovery=False):
@@ -522,7 +580,8 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
                 write_tree_zip(run / 'original.zip', snapshot)
                 phase('backup-saved', original_hash=tree_hash(snapshot))
                 if expected is not None:
-                    require(snapshot == expected, 'Настройки оператора на iPhone изменились во время операции. Запись отменена: '+recover_hint()+'.')
+                    # expected: the exact catalog, or a check for when only part of it is known.
+                    require(expected(snapshot) if callable(expected) else snapshot == expected, 'Настройки оператора на iPhone изменились во время операции. Запись отменена: '+recover_hint()+'.')
                 require(await remote_tree(afc, exported) == snapshot, 'Export changed after backup')
                 phase('final-authorized')
             phase('host-started')
@@ -584,7 +643,7 @@ def check_trigger(path, sims, targets=(BUNDLE,)):
     require(identifiers and all(isinstance(s, str) and re.fullmatch(r'\d{5,6}(?:_.*)?', s) for s in identifiers),
             'Unknown SupportedSIMs format in trigger')
     affected = set(identifiers)
-    for n, (k, data) in tree.items():
+    for n, (k, _) in tree.items():
         if k == 'l':
             leaf = n.split('/')[-1]
             require(re.fullmatch(r'\d{5,6}(?:_.*)?', leaf), 'Unexpected trigger symlink')
@@ -595,8 +654,6 @@ def check_trigger(path, sims, targets=(BUNDLE,)):
 
 async def install_trigger(device, path, run):
     from pymobiledevice3.services.installation_proxy import InstallationProxyService
-    from pymobiledevice3.services.syslog import SyslogService
-    from pymobiledevice3.exceptions import ConnectionTerminatedError
     # Override upstream extraction to preserve raw bytes without creating local symlinks.
     class Installer(InstallationProxyService):
         async def _upload_ipcc(self, file_stream, afc_client, dst):
@@ -606,49 +663,26 @@ async def install_trigger(device, path, run):
                     await afc_client.makedirs(target if entry.is_dir() else target.rsplit('/', 1)[0])
                     if not entry.is_dir():
                         await afc_client.set_file_contents(target, z.read(entry))
-    ready = asyncio.Event()
     status = {'ipcc_installation_completed': False, 'log_error': None, 'nr_data_verified': False}
-    async def watch():
-        try:
-            async with SyslogService(device) as log:
-                ready.set()
-                size = 0
-                with (run / 'commcenter.log').open('w', encoding='utf-8') as f:
-                    async for row in log.watch():
-                        line = row.decode(errors='replace') if isinstance(row, bytes) else row
-                        if 'CommCenter' in line:
-                            size += len(line)
-                            require(size < 16 * 1024 * 1024, 'Log limit reached')
-                            f.write(line + '\n')
-                            f.flush()
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            status['log_error'] = type(error).__name__ + ': ' + str(error)
-            ready.set()
-    watcher = asyncio.create_task(watch())
     try:
-        await asyncio.wait_for(ready.wait(), 10)
-        try:
-            async with Installer(device) as installer:
-                await asyncio.wait_for(installer.install_from_local(path), 90)
-        except Exception as error:
-            if 'InstallProhibited' in f'{type(error).__name__} {error}':
-                raise RuntimeError('iPhone запрещает установку (InstallProhibited). Проверьте «Настройки → '
-                                   'Экранное время → Ограничения контента и конфиденциальности → Покупки '
-                                   'в iTunes Store и App Store → Установка приложений: Да» и профили '
-                                   'управления (MDM). Ничего на телефоне не изменено.') from error
-            raise
-        status['ipcc_installation_completed'] = True
-        save_json(run / 'installation.json', status)
-        await asyncio.sleep(8)
+        async with syslog_capture(device, run / 'commcenter.log', lambda line: 'CommCenter' in line, status, linger=0):
+            try:
+                async with Installer(device) as installer:
+                    await asyncio.wait_for(installer.install_from_local(path), 90)
+            except Exception as error:
+                if 'InstallProhibited' in f'{type(error).__name__} {error}':
+                    raise RuntimeError('iPhone запрещает установку (InstallProhibited). Проверьте «Настройки → '
+                                       'Экранное время → Ограничения контента и конфиденциальности → Покупки '
+                                       'в iTunes Store и App Store → Установка приложений: Да» и профили '
+                                       'управления (MDM). Ничего на телефоне не изменено.') from error
+                raise
+            status['ipcc_installation_completed'] = True
+            save_json(run / 'installation.json', status)
+            await asyncio.sleep(8)
     except BaseException as error:
         status['installation_error'] = type(error).__name__ + ': ' + str(error)
         raise
     finally:
-        watcher.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await watcher
         save_json(run / 'installation.json', status)
     return status
 
@@ -874,6 +908,8 @@ def bundle_link(name):
 
 
 SLOT_NAMES = {'kOne': 'SIM 1', 'kTwo': 'SIM 2'}
+# Exit code for "written, but iOS did not confirm the chosen bundle"; 2 is argparse's usage error.
+UNCONFIRMED = 3
 SLOT_CHOICES = {'1': ('kOne',), '2': ('kTwo',), 'all': ('kOne', 'kTwo')}
 
 
@@ -884,8 +920,8 @@ def load_bundle_config(path=CONFIG):
     # A tiny subset of YAML: "default: Name" and "MCCMNC: Name", comments with #.
     config = {}
     if path.exists():
-        for number, line in enumerate(path.read_text(encoding='utf-8-sig').splitlines(), 1):
-            line = line.split('#', 1)[0].strip()
+        for number, raw in enumerate(path.read_text(encoding='utf-8-sig').splitlines(), 1):
+            line = raw.split('#', 1)[0].strip()
             if not line: continue
             match = re.fullmatch(r'["\']?(default|\d{5,6})["\']?\s*:\s*["\']?([A-Za-z0-9_]+?)(?:\.bundle)?["\']?', line)
             require(match, f'{path.name}, строка {number}: ожидается «default: Vodafone_hu» или «25001: Vodafone_hu» '
@@ -964,11 +1000,15 @@ def make_plan(original, sims):
     return desired
 
 
-def remove_imsi_links(original, only=None):
+def imsi_links(tree):
     # This installer creates root-level, 15-digit IMSI aliases, never directories.
+    return {n:v for n,v in tree.items() if v[0]=='l' and re.fullmatch(r'\d{15}',n)}
+
+
+def remove_imsi_links(original, only=None):
     # only: the IMSIs to remove; None removes every IMSI alias.
-    result = {n:v for n,v in original.items()
-              if not (v[0]=='l' and re.fullmatch(r'\d{15}',n) and (only is None or n in only))}
+    links = {n for n in imsi_links(original) if only is None or n in only}
+    result = {n:v for n,v in original.items() if n not in links}
     validate_tree(result)
     return result
 
@@ -1057,11 +1097,13 @@ async def execute_with_retry(args,assets):
         return await diagnostics(args)
     for attempt in range(1,args.attempts+1):
         print(f'Попытка {attempt} из {args.attempts}',flush=True)
+        before=set(pending(args.runs,args.udid))
         try:return await execute(args,assets)
         except Exception as error:
             # Roll back after any failure; retry only when a new attempt can change the outcome.
             # --status only reads: its failure must never start a recovery that writes to the phone.
-            failed=[] if args.status else pending(args.runs,args.udid)
+            # Stages left by earlier launches are rolled back only when recovery was asked for.
+            failed=[] if args.status else [p for p in pending(args.runs,args.udid) if args.recover or p not in before]
             if failed:
                 print('Сбой во время записи. Сначала возвращаю iPhone в исходное состояние…',flush=True)
                 device=await ready_device(args.udid,args.wait_seconds)
@@ -1080,11 +1122,14 @@ async def execute_with_retry(args,assets):
             await asyncio.sleep(2)
 
 
+BUNDLE_BLOCK = '----------Bundle File----------'
+
+
 def report_log(path, sims):
     results = {s['slot']:{'slot':s['slot'],'plmn':s['plmn'],'expected':s['bundle'],
                          'selected':None,'verified':False} for s in sims}
     if path.exists():
-        for block in path.read_text(encoding='utf-8',errors='replace').split('----------Bundle File----------'):
+        for block in path.read_text(encoding='utf-8',errors='replace').split(BUNDLE_BLOCK):
             resolved = re.findall(r'Resolved path\s*:\s*([^\r\n]+)',block)
             linked = re.findall(r'Linking Path\s*:\s*([^\r\n]+)',block)
             verified = re.findall(r'Verification Result\s*:\s*([^\r\n]+)',block)
@@ -1112,13 +1157,18 @@ def pending(runs, udid):
 def operation_lock(runs):
     runs.mkdir(parents=True,exist_ok=True)
     with (runs/'.lock').open('a+b') as f:
-        f.seek(0); f.write(b'0'); f.flush(); f.seek(0)
-        if sys.platform=='win32':
-            import msvcrt
-            msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1)
-        else:
-            import fcntl
-            fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        # Append mode: write the lockable byte only once, not on every launch.
+        if f.seek(0,2)==0: f.write(b'0'); f.flush()
+        f.seek(0)
+        try:
+            if sys.platform=='win32':
+                import msvcrt
+                msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1)
+            else:
+                import fcntl
+                fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except OSError:
+            raise RuntimeError('Скрипт уже запущен в другом окне. Дождитесь его завершения или закройте его.') from None
         try: yield
         finally:
             if sys.platform=='win32':
@@ -1130,9 +1180,15 @@ def bound(record,device):
             'Копия относится к другому телефону или каталогу.')
 
 
+EXPORT_SETTLE_SECONDS = 60
+
+
 async def recover_stage(device, failed, run, tag=''):
     from pymobiledevice3.services.afc import AfcService
     record = read_json(failed/'journal.json'); bound(record,device)
+    if record.get('recovered_by'):
+        print('Этап уже восстановлен:',record['recovered_by'],flush=True)
+        return
     remote = record.get('exported','')
     require(re.fullmatch(r'airlift-saved-[a-f0-9]{20}',remote),'Неверный путь восстановления.')
     books = read_tree_zip(failed/'books.zip'); state=read_json(failed/'books.json')
@@ -1145,6 +1201,15 @@ async def recover_stage(device, failed, run, tag=''):
             record['recovered_by']=str(run);record['books_restored']=True
             save_json(failed/'journal.json',record)
             return
+        if record.get('phase') in ('host-started','export-check') and not await exists(afc,remote):
+            # The export asset may already be sent: the host sends it before the pause, and
+            # FileComplete is asynchronous. Give atc time to finish the move before deciding
+            # that the catalog never left its place.
+            for _ in range(EXPORT_SETTLE_SECONDS):
+                if await exists(afc,remote): break
+                await asyncio.sleep(1)
+            else:
+                record['export_absent_after_wait']=EXPORT_SETTLE_SECONDS
         if await exists(afc,remote):
             desired = await remote_tree(afc,remote)
             if record.get('original_hash'):
@@ -1153,9 +1218,10 @@ async def recover_stage(device, failed, run, tag=''):
             desired = read_tree_zip(failed/'original.zip')
             require(tree_hash(desired)==record.get('original_hash'),'Локальная копия повреждена.')
         else:
-            # No exported copy on the phone and none saved locally: the catalog was never moved
-            # out, and the final asset is only sent after the backup is saved. Only the staging
-            # files in /var/mobile/Media changed, so undo those without another AirTraffic session.
+            # No exported copy on the phone (waited for above) and none saved locally: the catalog
+            # was never moved out, and the final asset is only sent after the backup is saved.
+            # Only Books and the staging folders in /var/mobile/Media changed: Books is put back
+            # here, the staging folders are removed by the next run's cleanup (clean_phone).
             require(record.get('phase') in ('created','staging','host-started','export-check'),
                     'Нет проверенной копии. Сохраните runs; восстановление остановлено.')
         if (other:=await restore_books(afc,books,state['existed'],state.get('top'))):record['books_other_changes']=other[:50]
@@ -1175,10 +1241,10 @@ async def recover_all(device, stages, run):
         await recover_stage(device,failed,run,f'-{i}' if len(stages)>1 else '')
 
 
-def check_trigger_hardware(path, hardware):
+def check_trigger_hardware(path, hardware, warn=True):
     tree = read_tree_zip(path)
     board = hardware.upper().removesuffix('AP')
-    for name,(kind,data) in tree.items():
+    for name,(kind,_) in tree.items():
         leaf = name.rsplit('/',1)[-1]
         if kind!='f' or '/signatures/' in name or not leaf.startswith('overrides_') or not leaf.endswith('.plist'):
             continue
@@ -1188,8 +1254,9 @@ def check_trigger_hardware(path, hardware):
             if signature in tree:
                 return True
             break
-    print('Предупреждение: в IPCC нет настроек с подписью для платы '+hardware+
-          '. Пересканирование МОЖЕТ не работать; продолжаю.', flush=True)
+    if warn:
+        print('Предупреждение: в IPCC нет настроек с подписью для платы '+hardware+
+              '. Пересканирование МОЖЕТ не работать; продолжаю.', flush=True)
     return False
 
 
@@ -1443,15 +1510,19 @@ async def execute(args,assets):
             print('Сверьте последние 4 цифры ICCID: Настройки → Основные → Об этом устройстве → ICCID нужной линии. '
                   '«сейчас» — профиль, загруженный iPhone; «план» — что будет записано.',flush=True)
             return
+        custom=None
         if args.trigger:
-            check_trigger(args.trigger,{str(r.get('MCC',''))+str(r.get('MNC','')) for r in rows},{s['bundle'] for s in sims if s['bundle']})
+            # Checked before any run folder or phone change; the copy below must be this same file.
+            custom=check_trigger(args.trigger,{str(r.get('MCC',''))+str(r.get('MNC','')) for r in rows},{s['bundle'] for s in sims if s['bundle']})
             check_trigger_hardware(args.trigger,info['HardwareModel'])
         unresolved=pending(args.runs,udid)
-        if args.recover == Path('AUTO'):
+        # Recomputed on every attempt: a failed attempt's auto-recovery may already have fixed some stages.
+        recover=args.recover
+        if recover == Path('AUTO'):
             if not unresolved:
                 print('Незавершённых операций для этого iPhone нет, восстанавливать нечего.');return 0
-            args.recover=unresolved
-        require(not unresolved or args.recover,
+            recover=unresolved
+        require(not unresolved or recover,
                 'Прошлая операция на этом iPhone не завершилась. Сначала '+recover_hint()+
                 ', затем повторите действие. Этап: '+str(unresolved[0] if unresolved else ''))
         run=args.runs/(datetime.now().strftime('%Y%m%d-%H%M%S-')+uuid.uuid4().hex[:6])
@@ -1461,25 +1532,36 @@ async def execute(args,assets):
         save_json(run/'device.json',{**info,'udid_hash':digest(udid.encode())})
         trigger=None
         plmns={str(r.get('MCC',''))+str(r.get('MNC','')) for r in rows}
-        for name in (() if args.trigger else ('AVEA_tr.ipcc','Swisscom_ch.ipcc','O2_Germany.ipcc')):
+        # Prefer a trigger with signed overrides for this board; otherwise the first one that fits the SIMs.
+        fitting=[]
+        for name in (() if args.trigger or assets is None else ('AVEA_tr.ipcc','Swisscom_ch.ipcc','O2_Germany.ipcc')):
             candidate=run/name;candidate.write_bytes(assets['triggers/'+name][1])
             try:
                 check_trigger(candidate,plmns,{s['bundle'] for s in sims if s['bundle']})
-                check_trigger_hardware(candidate,info['HardwareModel'])
+            except RuntimeError:candidate.unlink();continue
+            if check_trigger_hardware(candidate,info['HardwareModel'],warn=False):
                 trigger=candidate;break
-            except RuntimeError:candidate.unlink()
+            fitting.append(candidate)
+        if trigger is None and fitting:
+            trigger=fitting[0];check_trigger_hardware(trigger,info['HardwareModel'])
+        for extra in fitting:
+            if extra!=trigger:extra.unlink()
         if args.trigger:
             trigger=run/'custom-trigger.ipcc';trigger.write_bytes(args.trigger.read_bytes())
-            check_trigger(trigger,plmns,{s['bundle'] for s in sims if s['bundle']});check_trigger_hardware(trigger,info['HardwareModel'])
-        require(trigger is not None,'Не найден независимый триггер для этих SIM.')
-        DIAG['trigger']=trigger.name
+            require(digest(trigger.read_bytes())==custom['sha256'],'Файл IPCC изменился после проверки.')
+        # Recovery itself needs no trigger: it is only for the rescan at the end.
+        require(trigger is not None or recover,'Не найден независимый триггер для этих SIM.')
+        if trigger is not None: DIAG['trigger']=trigger.name
         if not args.recover:
             # No unfinished stage is known here (checked above), so AirLift leftovers are stale.
             cleaned=await clean_phone(device,run)
-            if cleaned:print('Убраны остатки прошлых запусков: '+', '.join(cleaned),flush=True)
-        if args.recover:
-            if isinstance(args.recover,list):await recover_all(device,args.recover,run)
-            else:await recover_stage(device,args.recover.resolve(),run)
+            kept=[n for n,v in cleaned.items() if str(v).startswith('не удалён')]
+            removed=[n for n in cleaned if n not in kept]
+            if removed:print('Убраны остатки прошлых запусков: '+', '.join(removed),flush=True)
+            if kept:print('Не удалось убрать остатки прошлых запусков: '+', '.join(kept),flush=True)
+        if recover:
+            if isinstance(recover,list):await recover_all(device,recover,run)
+            else:await recover_stage(device,recover.resolve(),run)
         elif args.restore:
             print('[1/4] Подготавливаю пересканирование…',flush=True)
             init=run/'initialize';init.mkdir();await install_trigger(device,trigger,init)
@@ -1521,6 +1603,10 @@ async def execute(args,assets):
             print('[3/4] Записываю ссылки по IMSI и проверяю результат…',flush=True)
             await transfer(device,run/'apply',payload=desired,expected=original)
             require(await transfer(device,run/'readback')==desired,'Обратное чтение не совпало.')
+        if trigger is None:
+            print('Каталог восстановлен. Пересканирование пропущено: нет подходящего триггера '
+                  'или assets.zip недоступен. Если связь не вернулась, перезагрузите iPhone.',flush=True)
+            return 0
         print('[4/4] Ожидаю применения профиля и проверки подписей…',flush=True)
         rescan=run/'rescan';rescan.mkdir()
         installation=await install_trigger(device,trigger,rescan)
@@ -1537,14 +1623,23 @@ async def execute(args,assets):
         installing=not (args.restore or args.restore_backup or args.recover)
         missing=[]
         if installing:
-            missing=sorted({s['expected'] for s in result if s['expected'] and s['expected']!=BUNDLE
+            # Roll back only on evidence: iOS chose another bundle, or CommCenter logged its bundle
+            # choice but not ours. A missing or broken log proves nothing and stays "unconfirmed".
+            log=rescan/'commcenter.log'
+            log_ok=(not (installation or {}).get('log_error') and log.exists()
+                    and BUNDLE_BLOCK in log.read_text(encoding='utf-8',errors='replace'))
+            missing=sorted({s['expected'] for s in result if s['expected']
+                            and (s['selected'] or log_ok)
                             and (s['selected'] or '').lower()!=s['expected'].lower()})
         if missing:
             # AFC cannot read /System, so a missing bundle only shows up in the rescan log.
             # Never leave links to it: put back the catalog saved before this write.
             print('iOS не выбрала '+', '.join(missing)+': такого пакета, видимо, нет в этой '
                   'версии iOS или имя введено с ошибкой. Возвращаю прежние настройки…',flush=True)
-            await transfer(device,run/'rollback',payload=original,expected=desired)
+            # The rescan trigger may have touched other parts of the catalog since the readback;
+            # only this run's IMSI links must still be exactly as written.
+            await transfer(device,run/'rollback',payload=original,
+                           expected=lambda tree:imsi_links(tree)==imsi_links(desired))
             require(await transfer(device,run/'rollback-readback')==original,
                     'Прежние настройки не вернулись: '+recover_hint()+'.')
             rescan=run/'rescan-rollback';rescan.mkdir()
@@ -1552,8 +1647,8 @@ async def execute(args,assets):
             save_json(run/'result.json',{'catalog_verified':True,'installation':installation,'slots':result,
                                          'rolled_back':True})
             print('Прежние настройки возвращены. Проверьте имя пакета (bundle.yaml или пункт 7) и повторите.',flush=True)
-            return 2
-        if unconfirmed:return 2
+            return UNCONFIRMED
+        if unconfirmed:return UNCONFIRMED
         print('Books: служебные файлы синхронизации возвращены в исходное состояние'+books_summary(run)+'.',flush=True)
         print('Готово. Включите авиарежим на 15 секунд и проверьте связь. Работа 5G не проверялась.')
         return 0
@@ -1634,7 +1729,7 @@ def environment_info():
         rows.append(('iTunes', win_file_version(itunes) if itunes else 'iTunes.exe не найден (возможно, версия из Microsoft Store)'))
         try:
             import winreg
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SYSTEM\CurrentControlSet\Services\Apple Mobile Device Service') as k:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SYSTEM\CurrentControlSet\Services\Apple Mobile Device Service'):
                 rows.append(('Apple Mobile Device Service', 'установлена'))
         except Exception:
             rows.append(('Apple Mobile Device Service', 'не найдена'))
@@ -1647,17 +1742,12 @@ def environment_info():
 def outstanding_assets(tree):
     # Read Books/Sync/Database/OutstandingAssets_4.sqlite (with its WAL) from a Books backup.
     import sqlite3
-    base = 'Sync/Database/OutstandingAssets_4.sqlite'
+    base = OUTSTANDING_DB.removeprefix('Books/')
     if base not in tree: return None
-    with tempfile.TemporaryDirectory() as d:
-        for suffix in ('', '-wal', '-shm'):
-            if base + suffix in tree: (Path(d)/('db.sqlite' + suffix)).write_bytes(tree[base + suffix][1])
-        try:
-            db = sqlite3.connect(Path(d)/'db.sqlite')
-            try: return db.execute('select ZPERSISTENTID, ZDOWNLOADCOMPLETEPATH from ZBCOUTSTANDINGASSET').fetchall()
-            finally: db.close()
-        except sqlite3.Error:
-            return None
+    try:
+        return read_outstanding({suffix: tree[base + suffix][1] for suffix in ('', '-wal', '-shm') if base + suffix in tree})
+    except sqlite3.Error:
+        return None
 
 
 def books_summary(run):
@@ -1686,7 +1776,7 @@ def run_details(run):
                          + (f", в корне: {', '.join(b['top'][:15])}" if b.get('top') else '')))
             outstanding = outstanding_assets(tree)
             if outstanding is not None:
-                mine = [x for x in outstanding if 'airlift-' in (x[0] or '') or (x[0] or '').endswith('Carrier Bundles/iPhone')]
+                mine = [x for x in outstanding if our_trace(x[0])]
                 rows.append(('  Незавершённые загрузки Books', f'{len(outstanding)}, из них скрипта {len(mine)}'))
                 for pid, done in mine[:6]:
                     rows.append(('    загрузка', f'{pid} → {done or "не завершена"}'))
@@ -1696,6 +1786,7 @@ def run_details(run):
             pass
         host = stage/'host.jsonl'
         if host.exists():
+            names = []
             for raw in host.read_text(encoding='utf-8', errors='replace').splitlines():
                 if not raw.startswith('CARRIER_SWAP_JSON:'): continue
                 try: row = json.loads(raw.split(':', 1)[1])
@@ -1710,13 +1801,8 @@ def run_details(run):
                         rows.append(('    Book', ', '.join(f'{k}={v[:60]}' for k, v in x.items())))
                 elif row.get('ok') is False:
                     rows.append(('  Ошибка AirTraffic', str(row.get('error'))))
-        if host.exists():
-            names = []
-            for raw in host.read_text(encoding='utf-8', errors='replace').splitlines():
-                if raw.startswith('CARRIER_SWAP_JSON:'):
-                    with contextlib.suppress(ValueError):
-                        row = json.loads(raw.split(':', 1)[1])
-                        if row.get('event') == 'message': names.append(row.get('name'))
+                elif row.get('event') == 'message':
+                    names.append(row.get('name'))
             if names: rows.append(('  Сообщения AirTraffic', ' → '.join(map(str, names))))
         dlog = stage/'device.log'
         if dlog.exists():
@@ -1863,9 +1949,14 @@ def main():
     require(sys.version_info >= (3,11), 'Нужен Python 3.11 или новее.')
     from importlib.metadata import version, PackageNotFoundError
     try: installed=version('pymobiledevice3')
-    except PackageNotFoundError: raise RuntimeError('Установите зависимости: python -m pip install -r requirements.txt')
+    except PackageNotFoundError: raise RuntimeError('Установите зависимости: python -m pip install -r requirements.txt') from None
     require(installed=='11.12.5', 'Нужен pymobiledevice3 11.12.5: python -m pip install -r requirements.txt')
-    assets=load_assets()
+    try: assets=load_assets()
+    except Exception as error:
+        # Recovery must not depend on the bundled triggers: they are only used for the final rescan.
+        if not args.recover: raise
+        print(f'Предупреждение: assets.zip недоступен ({error}). Восстановление пройдёт без пересканирования.',flush=True)
+        assets=None
     global APPLE_DIRS
     APPLE_DIRS=[str(Path(p).resolve()) for p in args.apple_dir]
     # No shell, no compiler, no native executable bundled with the archive.
@@ -1881,7 +1972,7 @@ def main():
     try:
         args.runs.mkdir(parents=True,exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=args.runs,prefix='.write-test-'):pass
-    except OSError as error:
+    except OSError:
         raise RuntimeError(f'Скрипт не может сохранить копии в папку: {args.runs}\n'
                            'Что сделать: закройте это окно, скопируйте всю папку CarrierSIM '
                            'в «Загрузки» и запустите оттуда.') from None
