@@ -112,7 +112,7 @@ def menu():
     print('  1  Установить профиль (по bundle.yaml)\n'
           '  2  Посмотреть SIM и план установки\n'
           '  3  Проверить компьютер и файлы\n\n'
-          '  4  Вернуть штатные профили (удалить IMSI-ссылки)\n'
+          '  4  Вернуть штатный профиль (выбранной SIM или всем)\n'
           '  5  Восстановить после сбоя\n'
           '  6  Открыть справку\n'
           '  7  Выбрать другой профиль\n\n'
@@ -124,7 +124,7 @@ def menu():
         if choice == '2': return ['--status']
         if choice == '3': return ['--check']
         if choice == '6': return ['--help']
-        if choice == '4': return ['--restore']
+        if choice == '4': return ['--restore', '--sims', choose_sims('Для каких SIM вернуть штатный профиль?')]
         if choice == '5': return ['--recover']
         if choice == '7': return other_profile()
         print('Введите число от 0 до 7. Установка ещё не начата.')
@@ -139,15 +139,18 @@ def other_profile():
         if not name: return False
         if re.fullmatch(r'[A-Za-z0-9_]+', name): break
         print('  Только латинские буквы, цифры и _. Например: O2_Germany.')
-    print('\n  На какие SIM установить?\n'
+    return ['--bundle', name, '--sims', choose_sims('На какие SIM установить?')]
+
+
+def choose_sims(question):
+    print(f'\n  {question}\n'
           '  1  SIM 1\n'
           '  2  SIM 2\n'
           '  Enter — обе (все найденные)')
     while True:
         sims = input('  SIM: ').strip()
-        if sims in ('', '1', '2'): break
+        if sims in ('', '1', '2'): return sims or 'all'
         print('  Введите 1, 2 или нажмите Enter.')
-    return ['--bundle', name, '--sims', sims or 'all']
 
 
 def main():

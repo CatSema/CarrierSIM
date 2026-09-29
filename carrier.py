@@ -964,10 +964,11 @@ def make_plan(original, sims):
     return desired
 
 
-def remove_imsi_links(original):
+def remove_imsi_links(original, only=None):
     # This installer creates root-level, 15-digit IMSI aliases, never directories.
+    # only: the IMSIs to remove; None removes every IMSI alias.
     result = {n:v for n,v in original.items()
-              if not (v[0]=='l' and re.fullmatch(r'\d{15}',n))}
+              if not (v[0]=='l' and re.fullmatch(r'\d{15}',n) and (only is None or n in only))}
     validate_tree(result)
     return result
 
@@ -1200,9 +1201,13 @@ async def execute(args,assets):
         top=await device.get_value() or {}
         slots=SLOT_CHOICES[args.sims]
         sims=select_sims(rows,args.bundles,slots) if not (args.restore or args.restore_backup or args.recover) else []
+        restore_imsis=None
         if args.restore:
             sims=[{'slot':r['Slot'],'plmn':str(r.get('MCC',''))+str(r.get('MNC','')),'bundle':None}
-                  for r in rows if r.get('Slot') in ('kOne','kTwo')]
+                  for r in rows if r.get('Slot') in slots]
+            if args.sims!='all':
+                # Only this SIM's alias is removed, so its IMSI must be known.
+                restore_imsis={s['imsi'] for s in select_sims(rows,None,slots)}
         print(f"\n  {MODELS.get(info['ProductType'], {}).get('name', info['ProductType'])} · iOS {info['ProductVersion']} ({info['BuildVersion']})",flush=True)
         row_by_slot={r.get('Slot'):r for r in rows}
         for s in sims:
@@ -1255,9 +1260,16 @@ async def execute(args,assets):
             init=run/'initialize';init.mkdir();await install_trigger(device,trigger,init)
             print('[2/4] Сохраняю текущие настройки…',flush=True)
             original=await transfer(device,run/'snapshot')
-            desired=remove_imsi_links(original)
+            if restore_imsis is not None:
+                now={s['imsi'] for s in select_sims(await device.get_value(key='CarrierBundleInfoArray') or [],None,slots)}
+                require(now==restore_imsis,'SIM изменились во время операции; запись отменена.')
+            desired=remove_imsi_links(original,restore_imsis)
             removed=len(original)-len(desired)
-            save_json(run/'plan.json',{'action':'remove-imsi','removed':removed,'before':tree_hash(original),'after':tree_hash(desired)})
+            save_json(run/'plan.json',{'action':'remove-imsi','sims':args.sims,'removed':removed,
+                                      'before':tree_hash(original),'after':tree_hash(desired)})
+            if not removed:
+                print('[3/4] Ссылок по IMSI для выбранных SIM нет: они уже на штатном профиле. Ничего не меняю.',flush=True)
+                return 0
             print(f'[3/4] Удаляю ссылки по IMSI: {removed}. Проверяю результат…',flush=True)
             await transfer(device,run/'restore',payload=desired,expected=original)
             require(await transfer(device,run/'readback')==desired,'Обратное чтение не совпало.')
@@ -1294,7 +1306,9 @@ async def execute(args,assets):
             ok=s['verified'] and (args.restore or (s['selected'] or '').lower()==s['expected'].lower());unconfirmed |= not ok
             print(f"{SLOT_NAMES[s['slot']]} ({s['plmn']}): "+(s['selected']+' — подпись принята' if ok else
                   'выбор нужного пакета не подтверждён; см. журнал'),flush=True)
-        if args.restore:print('Все ссылки по IMSI удалены. Обычные ссылки операторов сохранены.',flush=True)
+        if args.restore:
+            print(('Ссылка по IMSI выбранной SIM удалена, другая SIM не тронута.' if restore_imsis else
+                   'Все ссылки по IMSI удалены.')+' Обычные ссылки операторов сохранены.',flush=True)
         installing=not (args.restore or args.restore_backup or args.recover)
         missing=[]
         if installing:
@@ -1590,13 +1604,13 @@ def main():
     group=parser.add_mutually_exclusive_group()
     group.add_argument('--check',action='store_true',help='проверить файлы и библиотеки Apple, без подключения к телефону')
     group.add_argument('--status',action='store_true',help='показать найденные SIM и план, ничего не записывать')
-    group.add_argument('--restore',action='store_true',help='удалить все ссылки по IMSI и включить штатный выбор профилей; путь не нужен')
+    group.add_argument('--restore',action='store_true',help='удалить ссылки по IMSI и включить штатный выбор профилей; с --sims 1 или 2 только для этой SIM')
     group.add_argument('--restore-backup',type=Path,metavar='КАТАЛОГ',help='дополнительно: вернуть каталог из конкретной резервной копии')
     group.add_argument('--recover',type=Path,nargs='?',const=Path('AUTO'),metavar='ЭТАП',help='восстановиться после сбоя автоматически; путь к этапу необязателен')
     parser.add_argument('--bundle',metavar='ПАКЕТ',
                         help='один системный пакет для всех выбранных SIM вместо bundle.yaml, например O2_Germany')
     parser.add_argument('--sims',choices=SLOT_CHOICES,default='all',
-                        help='на какие SIM установить: 1, 2 или all — все найденные (по умолчанию)')
+                        help='какие SIM менять (установка и --restore): 1, 2 или all — все найденные (по умолчанию)')
     parser.add_argument('--trigger',type=Path,metavar='IPCC',help='свой подписанный IPCC вместо комплектного; плата и SIM проверяются')
     parser.add_argument('--attempts',type=int,default=3,metavar='N',help='попытки при временном сбое связи (по умолчанию 3)')
     parser.add_argument('--wait-seconds',type=int,default=180,metavar='СЕК',help='ожидать подключение и разблокировку (по умолчанию 180 секунд)')
