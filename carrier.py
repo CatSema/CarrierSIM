@@ -528,7 +528,8 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
             phase('host-started')
             async with device_log(device, run / 'device.log'):
                 await host_session(device.udid, assets, pause, run)
-            for _ in range(30):
+            # The phone may take several seconds to move the final asset after the session ends.
+            for _ in range(150):
                 if await exists(afc, final_source) is None:
                     break
                 await asyncio.sleep(0.1)
@@ -813,7 +814,7 @@ def native_host(udid, assets, directories):
                 require(sys.stdin.readline().strip() == 'CONTINUE', 'Резервная копия не подтверждена')
             host.call('ATHostConnectionSendAssetCompleted', connection, identifier, 'Book', destination)
             if i+1 < len(assets): time.sleep(.9)
-        time.sleep(2)
+        time.sleep(6)
         framed({'ok':True})
     finally:
         if connection: host.at.ATHostConnectionRelease(connection)
