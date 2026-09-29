@@ -945,7 +945,7 @@ def load_bundle_config(path=CONFIG):
             line = raw.split('#', 1)[0].strip()
             if not line: continue
             match = re.fullmatch(r'["\']?(default|\d{5,6})["\']?\s*:\s*["\']?([A-Za-z0-9_]+?)(?:\.bundle)?["\']?', line)
-            require(match, f'{path.name}, строка {number}: ожидается «default: Vodafone_hu» или «25001: Vodafone_hu» '
+            require(match, f'{path.name}, строка {number}: ожидается «default: Vodafone_hu» или «25001: Vodafone_ro» '
                            '(MCCMNC без пробела, имя пакета латиницей).')
             key, name = match.groups()
             require(key not in config, f'{path.name}, строка {number}: {key} указан дважды.')

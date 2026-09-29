@@ -29,7 +29,7 @@ IMSI, операция останавливается до записи.
 macOS: Запуск macOS.command
 Windows: Запуск Windows.cmd
 Откроется меню:
-  1  Установить профиль по bundle.yaml (по умолчанию Vodafone_hu на все SIM)
+  1  Установить профиль по bundle.yaml (МТС России — Vodafone_ro, остальные — Vodafone_hu)
   2  Посмотреть SIM и план установки, без записи
   3  Проверить компьютер и файлы, без телефона
   4  Вернуть штатный профиль выбранной SIM или всем (удалить IMSI-симлинки)
@@ -111,7 +111,7 @@ chmod u+x "$HOME/Downloads/CarrierSIM/Запуск macOS.command"
 
 python3 carrier.py --check          Проверить файлы и библиотеки, без телефона.
 python3 carrier.py --status         Прочитать SIM и показать план, без записи.
-python3 carrier.py                  Vodafone_hu на все найденные SIM.
+python3 carrier.py                  Профили из bundle.yaml на все найденные SIM.
 python3 carrier.py --bundle O2_Germany --sims 1
                                     Другой системный пакет, только на SIM 1.
 python3 carrier.py --restore        Удалить IMSI-симлинки (пункт 4).
@@ -151,7 +151,7 @@ IMSI не выводится в консоль, но есть в копиях и
 КАКОЙ ПРОФИЛЬ СТАВИТЬ: bundle.yaml
 Файл bundle.yaml рядом со скриптом задаёт пакет для пункта 1:
   default: Vodafone_hu      пакет по умолчанию для всех операторов
-  25001: Vodafone_hu        пакет для оператора с этим MCCMNC (без пробела)
+  25001: Vodafone_ro        пакет для МТС России (MCCMNC без пробела)
 Для каждой SIM сначала ищется её MCCMNC, затем default; без файла —
 Vodafone_hu. Имя пакета — как папка в /System/Library/Carrier Bundles/iPhone,
 без .bundle. Строки с # — комментарии. Ошибка в файле показывается с номером
