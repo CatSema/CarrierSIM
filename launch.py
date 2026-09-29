@@ -6,12 +6,26 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parent
+UNCONFIRMED = 3  # carrier.py: written, but iOS did not confirm the chosen bundle
+
+
+def run_carrier(python, args, **kwargs):
+    # Ctrl+C reaches carrier.py too. The launcher must not kill it 0.25 s later (what
+    # subprocess.run does on KeyboardInterrupt): carrier.py needs time to put Books back
+    # and write its journal. So the launcher swallows SIGINT while carrier.py runs. A no-op
+    # handler, not SIG_IGN: an ignored SIGINT would be inherited and carrier.py could not be stopped.
+    previous = signal.signal(signal.SIGINT, lambda *_: None)
+    try:
+        return subprocess.run([str(python), '-u', str(ROOT / 'carrier.py'), *args], cwd=ROOT, **kwargs).returncode
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 def check_writable():
@@ -19,7 +33,7 @@ def check_writable():
     try:
         with tempfile.NamedTemporaryFile(dir=ROOT, prefix='.write-test-'):
             pass
-    except OSError as error:
+    except OSError:
         raise RuntimeError(f'Скрипт не может работать из этой папки: {ROOT}\n'
                            'Что сделать: закройте это окно, скопируйте всю папку CarrierSIM '
                            'в «Загрузки» и запустите оттуда.') from None
@@ -163,7 +177,7 @@ def main():
     python = None
     if len(sys.argv) > 1:
         python = python_environment()
-        return subprocess.run([str(python), '-u', str(ROOT / 'carrier.py'), *sys.argv[1:]], cwd=ROOT).returncode
+        return run_carrier(python, sys.argv[1:])
     while True:
         args = menu()
         if args is None: return 0
@@ -171,11 +185,10 @@ def main():
         print('\n' + '─' * 56, flush=True)
         try:
             if python is None: python = python_environment()
-            result = subprocess.run([str(python), '-u', str(ROOT / 'carrier.py'), *args], cwd=ROOT,
-                                    env={**os.environ, 'CARRIERSIM_MENU': '1'})
-            if result.returncode == 2:
+            code = run_carrier(python, args, env={**os.environ, 'CARRIERSIM_MENU': '1'})
+            if code == UNCONFIRMED:
                 print('\nВыбор профиля не подтверждён. Подробности — в журнале операции.')
-            elif result.returncode:
+            elif code:
                 print('\nДействие не завершено. Причина указана выше.')
         except Exception as error:
             print('\nОшибка запуска:', error)
