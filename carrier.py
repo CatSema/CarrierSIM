@@ -1023,7 +1023,8 @@ async def execute_with_retry(args,assets):
         try:return await execute(args,assets)
         except Exception as error:
             # Roll back after any failure; retry only when a new attempt can change the outcome.
-            failed=pending(args.runs,args.udid)
+            # --status only reads: its failure must never start a recovery that writes to the phone.
+            failed=[] if args.status else pending(args.runs,args.udid)
             if failed:
                 print('Сбой во время записи. Сначала возвращаю iPhone в исходное состояние…',flush=True)
                 device=await ready_device(args.udid,args.wait_seconds)
