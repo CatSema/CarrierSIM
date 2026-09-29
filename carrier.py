@@ -900,6 +900,38 @@ def bundle_for(plmn, config):
     return config.get(plmn) or config.get('default') or BUNDLE
 
 
+OPERATORS = {'232-05': 'One', '250-01': 'МТС', '250-02': 'МегаФон', '250-11': 'Yota', '250-20': 'T2',
+             '250-99': 'Билайн', '257-01': 'A1', '257-02': 'МТС BY', '257-04': 'life:)'}
+
+
+def mask_phone(phone):
+    clean = re.sub(r'[^\d+]', '', phone) if isinstance(phone, str) else ''
+    if not clean.startswith('+') or len(clean) < 8:
+        return 'номер недоступен'
+    code = 2 if clean.startswith(('+7', '+1')) else 4 if clean.startswith(
+        ('+375', '+992', '+993', '+994', '+995', '+996', '+998')) else 3
+    return f'{clean[:code]} ••• •••{clean[-4:]}'
+
+
+def sim_line(row, top):
+    # What the user can match against Settings: operator, SIM type, ICCID tail, masked number,
+    # and the bundle iOS actually loaded (an IMSI link shows up here too).
+    slot = row.get('Slot')
+    plmn = f"{row.get('MCC', '')}-{row.get('MNC', '')}"
+    operator = f'{OPERATORS[plmn]} ({plmn})' if plmn in OPERATORS else plmn
+    tray_empty = 'Absent' in str(top.get('SIMTrayStatus', ''))
+    embedded = top.get('SIM1IsEmbedded') if slot == 'kOne' else None
+    kind = ('eSIM' if embedded or (embedded is None and tray_empty) else
+            'физ. SIM' if embedded is False else 'тип неизвестен')
+    iccid = str(row.get('IntegratedCircuitCardIdentity', ''))
+    # Lockdown reports the phone number of one line only; show it for the SIM it belongs to.
+    phone = (mask_phone(top.get('PhoneNumber')) if iccid and iccid == str(top.get('IntegratedCircuitCardIdentity', ''))
+             else 'номер недоступен')
+    current = str(row.get('CFBundleIdentifier', '')).removeprefix('com.apple.') or 'неизвестно'
+    return '  ·  '.join((SLOT_NAMES.get(slot, str(slot)), operator, kind,
+                         f'ICCID …{iccid[-4:]}' if len(iccid) >= 4 else 'ICCID недоступен', phone, 'сейчас: ' + current))
+
+
 def select_sims(rows, config=None, slots=SLOT_CHOICES['all']):
     selected = []; seen_slots = set(); seen_imsi = set()
     for row in rows:
@@ -1163,18 +1195,22 @@ async def execute(args,assets):
     try:
         info=await device_info(device); DIAG['info']=info; check_phone(info)
         rows=await device.get_value(key='CarrierBundleInfoArray') or []
+        top=await device.get_value() or {}
         slots=SLOT_CHOICES[args.sims]
         sims=select_sims(rows,args.bundles,slots) if not (args.restore or args.restore_backup or args.recover) else []
         if args.restore:
             sims=[{'slot':r['Slot'],'plmn':str(r.get('MCC',''))+str(r.get('MNC','')),'bundle':None}
                   for r in rows if r.get('Slot') in ('kOne','kTwo')]
         print(f"\n  {MODELS.get(info['ProductType'], {}).get('name', info['ProductType'])} · iOS {info['ProductVersion']} ({info['BuildVersion']})",flush=True)
+        row_by_slot={r.get('Slot'):r for r in rows}
         for s in sims:
-            label = {'kOne':'SIM 1', 'kTwo':'SIM 2'}[s['slot']]
             target='штатный профиль' if args.restore else s['bundle'].removesuffix('.bundle')+' (по IMSI)'
-            print(f"  {label}  ·  {s['plmn']}  →  {target}",flush=True)
+            print(f"  {sim_line(row_by_slot[s['slot']],top)}  →  план: {target}",flush=True)
         print(flush=True)
-        if args.status: return
+        if args.status:
+            print('Сверьте последние 4 цифры ICCID: Настройки → Основные → Об этом устройстве → ICCID нужной линии. '
+                  '«сейчас» — профиль, загруженный iPhone; «план» — что будет записано.',flush=True)
+            return
         if args.trigger:
             check_trigger(args.trigger,{str(r.get('MCC',''))+str(r.get('MNC','')) for r in rows},{s['bundle'] for s in sims if s['bundle']})
             check_trigger_hardware(args.trigger,info['HardwareModel'])
