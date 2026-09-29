@@ -115,7 +115,9 @@ def menu():
           '  4  Вернуть штатные профили (удалить IMSI-ссылки)\n'
           '  5  Восстановить после сбоя\n'
           '  6  Открыть справку\n'
-          '  7  Выбрать другой профиль\n\n'
+          '  7  Выбрать другой профиль\n'
+          '  8  Диагностика связи (IMS, VoWiFi, VoLTE, 5G) — только чтение\n'
+          '  9  Проверка звонка (кодек, канал) — только чтение\n\n'
           '  0  Выход\n')
     while True:
         choice = input('  Ваш выбор: ').strip()
@@ -127,7 +129,9 @@ def menu():
         if choice == '4': return ['--restore']
         if choice == '5': return ['--recover']
         if choice == '7': return other_profile()
-        print('Введите число от 0 до 7. Установка ещё не начата.')
+        if choice == '8': return ['--diagnose']
+        if choice == '9': return ['--watch-call']
+        print('Введите число от 0 до 9. Установка ещё не начата.')
 
 
 def other_profile():

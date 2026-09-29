@@ -1018,6 +1018,9 @@ def transient_error(error):
 async def execute_with_retry(args,assets):
     # Once selected, reconnect only to this exact phone, even if a different phone appears.
     args.udid=await choose_device(args.udid,args.wait_seconds)
+    if args.diagnose or args.watch_call:
+        # Read-only: no retries and no auto-recovery, which would write to the phone.
+        return await diagnostics(args)
     for attempt in range(1,args.attempts+1):
         print(f'Попытка {attempt} из {args.attempts}',flush=True)
         try:return await execute(args,assets)
@@ -1154,6 +1157,228 @@ def check_trigger_hardware(path, hardware):
           '. Пересканирование МОЖЕТ не работать; продолжаю.', flush=True)
     return False
 
+
+
+# Read-only telephony diagnostics from the CommCenter log stream (os_trace_relay).
+# Note: patterns come from iOS 27.x CommCenter strings seen in rescan logs; Apple
+# does not document them, so a future iOS may rename them. Raw masked log is saved
+# next to the report so the patterns can be updated.
+DIAG_PATTERNS = {
+    'ims_voice': re.compile(r'IMS Voice registered: (true|false)'),
+    'ims_over_wifi': re.compile(r'IMS registered\s*:\s*(true|false)\s*,\s*Over Wifi\s*:\s*(true|false)'),
+    'vowifi_pref': re.compile(r'VoWiFi, user preference status is (\w+).*?service status: (\w+)'),
+    'vowifi_config': re.compile(r'VoWiFi configuration is: (\w+) \(preferred in roaming: (\w+)\)'),
+    'features': re.compile(r'VoLTE Feature support: (\w+), VoNR Feature support: (\w+), VoWiFi Feature support: (\w+)'),
+    'roaming': re.compile(r'Is device roaming: (kRoaming|kNotRoaming)\b'),
+    'reg_status': re.compile(r'Registration status is (k\w+)'),
+    'rat': re.compile(r'(?:current RAT \(|RAT remains at |current RAT set to )(kRat\w+)'),
+    'data_mode': re.compile(r'(?:current DataMode set to |Data mode - )(k\w+)'),
+    'plmn': re.compile(r'(kRat\w+) PLMN: (\d{3}-\d{2,3})'),
+    'signal': re.compile(r'Rsrp=\{y=(-?[\d.]+) : \d+\}, Sinr=\{y=(-?[\d.]+)'),
+    'wifi_name': re.compile(r"Operator name is being overridden to '([^']+)'"),
+    'sa': re.compile(r'5G Standalone (enabled|disabled)(?: by (\w+))?'),
+    'ims_reg': re.compile(r'UE is Registered for ([\w+]+) on (\w+)'),
+    'call_status': re.compile(r'slot k\w+ call status (\w+)'),
+}
+# P-Access-Network-Info in SIP says which radio carried the call.
+SIP_ACCESS = {'IEEE-802.11':'Wi-Fi (VoWiFi)','3GPP-E-UTRAN':'LTE (VoLTE)','3GPP-E-UTRAN-FDD':'LTE (VoLTE)',
+              '3GPP-E-UTRAN-TDD':'LTE (VoLTE)','3GPP-NR':'5G (VoNR)','3GPP-NR-FDD':'5G (VoNR)',
+              '3GPP-NR-TDD':'5G (VoNR)','3GPP-UTRAN-FDD':'3G'}
+
+
+CODEC_NAMES = {'EVS/16000':'EVS (HD Voice+)','AMR-WB/16000':'AMR-WB (HD Voice)',
+               'AMR/8000':'AMR-NB (обычное качество)','PCMA/8000':'G.711 A-law (обычное качество)',
+               'PCMU/8000':'G.711 µ-law (обычное качество)'}
+
+
+def sip_answer_codec(message):
+    # An SDP answer lists exactly one voice codec (plus telephone-event); offers list several.
+    m = re.search(r'^\s*m=audio \d+ RTP/AVP ([\d ]+)', message, re.M)
+    if not m:
+        return None
+    maps = dict(re.findall(r'a=rtpmap:(\d+) ([\w.-]+/\d+)', message))
+    voice = [maps[p] for p in m.group(1).split() if p in maps and not maps[p].startswith('telephone-event')]
+    return voice[0] if len(voice) == 1 else None
+
+
+def mask_log(text):
+    # Phone numbers, IMSI/ICCID and other long identifiers never reach disk or screen.
+    return re.sub(r'\+?\d[\d ()-]{6,}\d', '<num>', text)
+
+
+def log_slot(entry):
+    # CommCenter prefixes per-subscription lines with "<slot>.<n> "; categories may end in the slot.
+    # Heuristic, unverified on every iOS; unmatched lines are reported as "общее".
+    if m := re.match(r'([12])\.\d+\s', entry.message):
+        return {'1':'kOne','2':'kTwo'}[m.group(1)]
+    if m := re.search(r'\bslot (kOne|kTwo)\b', entry.message):
+        return m.group(1)
+    # Categories end in ".<slot>" (reg.ctr.2, sig.mav5.1) or ".<slot>.<n>" (sip.dump.ims.1.4).
+    if entry.label and (m := re.search(r'\.([12])(?:\.\d+)?$', entry.label.category or '')):
+        return {'1':'kOne','2':'kTwo'}[m.group(1)]
+    return None
+
+
+def sip_assembler():
+    # CommCenter logs each SIP line as its own entry in category sip.dump.*:
+    # "==== src --> dst METHOD ====", the message lines, then a "=====" rule.
+    # Returns feed(entry) -> (first SIP line, access network, answered codec) once a message completes.
+    bufs = {}
+    def feed(entry):
+        cat = entry.label.category if entry.label else ''
+        if not (cat or '').startswith('sip.dump'):
+            return None
+        line = entry.message.strip()
+        if re.fullmatch(r'=+', line):
+            if cat not in bufs:
+                return None
+            msg = '\n'.join(bufs.pop(cat))
+            cseq = re.search(r'^CSeq: \d+ (\w+)', msg, re.M)
+            if not cseq or cseq.group(1) not in ('INVITE', 'PRACK', 'UPDATE', 'ACK', 'BYE', 'CANCEL'):
+                return None  # registration, presence and SMS traffic is not a call
+            first = next((l for l in msg.splitlines() if l.strip()), '')
+            first = re.sub(r'^(\w+) \S+ SIP/2\.0$', r'\1', first)  # drop request URI (holds the number)
+            access = re.search(r'P-Access-Network-Info: ([\w.-]+)', msg)
+            return first, access and SIP_ACCESS.get(access.group(1), access.group(1)), sip_answer_codec(msg)
+        elif line.startswith('='):
+            bufs[cat] = []  # "==== src --> dst ... ====" header, either direction
+        elif cat in bufs:
+            bufs[cat].append(line)
+        return None
+    return feed
+
+
+async def commcenter_stream(device, seconds, log_path, on_entry):
+    from pymobiledevice3.services.os_trace import OsTraceService
+    pids = (await OsTraceService(device).get_pid_list()).get('Payload', {})
+    pid = next((int(p) for p, v in pids.items() if v.get('ProcessName') == 'CommCenter'), None)
+    require(pid is not None, 'Процесс CommCenter не найден на iPhone.')
+    with log_path.open('w', encoding='utf-8') as f:
+        try:
+            async with asyncio.timeout(seconds):
+                async for e in OsTraceService(device).syslog(pid=pid):
+                    msg = mask_log(e.message)
+                    cat = f'{e.label.subsystem}:{e.label.category}' if e.label else '-'
+                    f.write(f'{e.timestamp:%H:%M:%S} [{cat}] {msg}\n')
+                    on_entry(e, msg)
+        except TimeoutError:
+            pass
+
+
+def diag_collect(state):
+    feed_sip = sip_assembler()
+    def on_entry(e, msg):
+        # Returns the completed SIP message summary, if this entry finished one.
+        slot = log_slot(e) or 'общее'
+        for key, pat in DIAG_PATTERNS.items():
+            if m := pat.search(msg):
+                state.setdefault(slot, {})[key] = m.groups()
+        if sip := feed_sip(e):
+            _, access, codec = sip
+            if access:
+                state.setdefault(slot, {})['call_access'] = (access,)
+            if codec:
+                state.setdefault(slot, {})['codec'] = (codec,)
+        return sip
+    return on_entry
+
+
+def sim_header(row):
+    return f"{SLOT_NAMES[row['Slot']]}  ·  {row.get('MCC', '')}{row.get('MNC', '')}"
+
+
+def diag_report(state, rows):
+    yes = lambda v: {'true':'да','false':'нет','kTrue':'да','kFalse':'нет'}.get(v, v)
+    rat = lambda v: v and {'kRatGSM':'2G (GSM)','kRatUMTS':'3G (UMTS)','kRatLTE':'4G (LTE)','kRatNR':'5G (NR)'}.get(v, v)
+    reg = lambda v: v and {'kRegisteredHome':'в домашней сети','kRegisteredRoaming':'в роуминге',
+                           'kNotRegistered':'нет регистрации','kRegistrationDenied':'отказ сети',
+                           'kSearching':'поиск сети'}.get(v, v)
+    lines = []
+    for slot in [r.get('Slot') for r in rows if r.get('Slot') in ('kOne','kTwo')] + ['общее']:
+        s = state.get(slot, {})
+        if slot == 'общее' and not s:
+            continue
+        head = sim_header(next(r for r in rows if r.get('Slot') == slot)) \
+            if slot != 'общее' else 'Без привязки к SIM (слот не определён по журналу)'
+        lines.append('\n  ' + head)
+        g = lambda k, i=0: s[k][i] if k in s and s[k][i] else None
+        items = [
+            ('IMS', g('ims_reg') and f"{g('ims_reg')} через {g('ims_reg',1)}"),
+            ('IMS (голос)', yes(g('ims_voice'))),
+            ('IMS через Wi-Fi', g('ims_over_wifi') and f"регистрация: {yes(g('ims_over_wifi'))}, Wi-Fi: {yes(g('ims_over_wifi',1))}"),
+            ('VoWiFi', g('vowifi_pref') and f"настройка: {g('vowifi_pref')}, служба: {g('vowifi_pref',1)}"),
+            ('VoWiFi из', g('vowifi_config') and f"{g('vowifi_config')}, предпочтителен в роуминге: {yes(g('vowifi_config',1))}"),
+            ('Поддержка', g('features') and f"VoLTE {yes(g('features'))}, VoNR {yes(g('features',1))}, VoWiFi {yes(g('features',2))}"),
+            ('Wi-Fi Calling имя', g('wifi_name') and f"«{g('wifi_name')}» (VoWiFi активен)"),
+            ('Регистрация', reg(g('reg_status'))),
+            ('Роуминг', g('roaming') and {'kRoaming':'да','kNotRoaming':'нет'}.get(g('roaming'), g('roaming'))),
+            ('Сеть', rat(g('rat'))),
+            ('Данные', g('data_mode') and g('data_mode').removeprefix('k')),
+            ('Обслуживающая сеть', g('plmn') and f"{g('plmn',1)} ({rat(g('plmn'))})"),
+            ('Сигнал LTE', g('signal') and f"RSRP {float(g('signal')):.0f} дБм, SINR {float(g('signal',1)):.1f} дБ"),
+            ('5G SA', g('sa') and (g('sa') == 'enabled' and 'включён' or f"выключен ({g('sa',1) or 'причина не указана'})")),
+            ('Звонок через', g('call_access')),
+            ('Кодек звонка', g('codec') and CODEC_NAMES.get(g('codec'), g('codec'))),
+        ]
+        shown = [(name, val) for name, val in items if val]
+        for name, val in shown:
+            lines.append(f'    {name:20} {val}')
+        if len(shown) < len(items):
+            lines.append('    остальное: нет в журнале за это время')
+    return '\n'.join(lines)
+
+
+async def run_diagnose(device, args, rows):
+    out = args.runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'diagnose')
+    out.mkdir(parents=True, mode=0o700)
+    print(f'Собираю журнал CommCenter {args.seconds} с. Чтобы iOS заново прошла регистрацию,\n'
+          'включите и через 10 секунд выключите авиарежим (Wi-Fi оставьте включённым).', flush=True)
+    state = {}
+    await commcenter_stream(device, args.seconds, out / 'commcenter.log', diag_collect(state))
+    report = diag_report(state, rows)
+    print(report, flush=True)
+    (out / 'report.txt').write_text(report + '\n', encoding='utf-8')
+    print(f'\nСлот SIM определяется по журналу эвристически. Журнал (замаскирован): {out}', flush=True)
+    return 0
+
+
+async def run_watch_call(device, args, rows):
+    out = args.runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'watch-call')
+    out.mkdir(parents=True, mode=0o700)
+    print(f'Слушаю журнал CommCenter {args.seconds} с. Сделайте тестовый звонок сейчас.\n'
+          'Для VoWiFi: авиарежим + Wi-Fi. Для VoLTE: Wi-Fi выключен.', flush=True)
+    state = {}
+    collect = diag_collect(state)
+    def on_entry(e, msg):
+        sip = collect(e, msg)
+        slot = {'kOne':'SIM 1','kTwo':'SIM 2'}.get(log_slot(e), '     ')
+        if sip:
+            first, access, codec = sip
+            extra = ' · '.join(x for x in (access, codec and 'кодек ' + CODEC_NAMES.get(codec, codec)) if x)
+            print(f'  {e.timestamp:%H:%M:%S} {slot} SIP {first}' + (f'  [{extra}]' if extra else ''), flush=True)
+        elif m := DIAG_PATTERNS['call_status'].search(msg):
+            print(f'  {e.timestamp:%H:%M:%S} {slot} звонок: {m.group(1)}', flush=True)
+    await commcenter_stream(device, args.seconds, out / 'commcenter.log', on_entry)
+    codecs = sorted({CODEC_NAMES.get(v['codec'][0], v['codec'][0]) for v in state.values() if 'codec' in v})
+    print('\nСогласованные кодеки: ' + (', '.join(codecs) if codecs else 'звонков с ответом SDP не было'), flush=True)
+    report = diag_report(state, rows)
+    print(report, flush=True)
+    (out / 'report.txt').write_text(report + '\n', encoding='utf-8')
+    print(f'\nЖурнал (замаскирован): {out}', flush=True)
+    return 0
+
+
+async def diagnostics(args):
+    device=await ready_device(args.udid,args.wait_seconds)
+    try:
+        info=await device_info(device); DIAG['info']=info
+        rows=await device.get_value(key='CarrierBundleInfoArray') or []
+        print(f"\n  {MODELS.get(info['ProductType'], {}).get('name', info['ProductType'])} · iOS {info['ProductVersion']} ({info['BuildVersion']})",flush=True)
+        for r in rows:
+            if r.get('Slot') in SLOT_NAMES: print('  '+sim_header(r),flush=True)
+        print(flush=True)
+        return await (run_diagnose if args.diagnose else run_watch_call)(device,args,rows)
+    finally:await device.close()
 
 
 async def execute(args,assets):
@@ -1555,12 +1780,15 @@ def main():
     group.add_argument('--restore',action='store_true',help='удалить все ссылки по IMSI и включить штатный выбор профилей; путь не нужен')
     group.add_argument('--restore-backup',type=Path,metavar='КАТАЛОГ',help='дополнительно: вернуть каталог из конкретной резервной копии')
     group.add_argument('--recover',type=Path,nargs='?',const=Path('AUTO'),metavar='ЭТАП',help='восстановиться после сбоя автоматически; путь к этапу необязателен')
+    group.add_argument('--diagnose',action='store_true',help='отчёт по SIM: IMS, VoLTE/VoWiFi/VoNR, роуминг, сеть, 5G SA; только чтение журнала')
+    group.add_argument('--watch-call',action='store_true',help='слушать журнал во время тестового звонка: кодек (EVS/AMR), канал; только чтение')
     parser.add_argument('--bundle',metavar='ПАКЕТ',
                         help='один системный пакет для всех выбранных SIM вместо bundle.yaml, например O2_Germany')
     parser.add_argument('--sims',choices=SLOT_CHOICES,default='all',
                         help='на какие SIM установить: 1, 2 или all — все найденные (по умолчанию)')
     parser.add_argument('--trigger',type=Path,metavar='IPCC',help='свой подписанный IPCC вместо комплектного; плата и SIM проверяются')
     parser.add_argument('--attempts',type=int,default=3,metavar='N',help='попытки при временном сбое связи (по умолчанию 3)')
+    parser.add_argument('--seconds',type=int,metavar='СЕК',help='длительность --diagnose (по умолчанию 90) или --watch-call (по умолчанию 180)')
     parser.add_argument('--wait-seconds',type=int,default=180,metavar='СЕК',help='ожидать подключение и разблокировку (по умолчанию 180 секунд)')
     parser.add_argument('--udid',metavar='ID',help='выбрать iPhone, если по USB подключено несколько')
     parser.add_argument('--apple-dir',action='append',default=[],metavar='ПАПКА',help='Windows: папка DLL Apple; можно указать несколько раз')
@@ -1577,6 +1805,8 @@ def main():
         args.bundles=load_bundle_config()
     require(1 <= args.attempts <= 10, 'Число попыток должно быть от 1 до 10.')
     require(0 <= args.wait_seconds <= 3600, 'Ожидание должно быть от 0 до 3600 секунд.')
+    args.seconds = args.seconds or (180 if args.watch_call else 90)
+    require(10 <= args.seconds <= 1800, '--seconds: от 10 до 1800.')
     os.umask(0o077)
     require(sys.version_info >= (3,11), 'Нужен Python 3.11 или новее.')
     from importlib.metadata import version, PackageNotFoundError
