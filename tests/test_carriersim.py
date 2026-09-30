@@ -330,6 +330,29 @@ class ReportTest(unittest.IsolatedAsyncioTestCase):
             saved = await self.run_with(iter(['д', stop]))
             self.assertIn('вопросы прерваны', saved)
             self.assertIn('Журнал CommCenter', saved)
+            self.assertIn('в авиарежиме по Wi-Fi проходит: да', saved)  # the interrupted SIM keeps its answer
+
+    async def test_ctrl_c_interrupts_the_question_itself(self):
+        # Under asyncio.run the first Ctrl-C only cancels the task; while asking it must reach input().
+        import signal
+        handlers = []
+        def answer(*_):
+            handlers.append(signal.getsignal(signal.SIGINT)); return ''
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            with tempfile.TemporaryDirectory() as runs, \
+                    patch.object(carrier, 'commcenter_stream', AsyncMock()), \
+                    patch.object(carrier.sys.stdin, 'isatty', return_value=True), \
+                    patch('builtins.input', answer), \
+                    patch.dict(carrier.DIAG, {'info': {'ProductType': 'iPhone18,1'}}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                await carrier.run_report(None, SimpleNamespace(runs=pathlib.Path(runs), seconds=10), self.ROWS)
+            after = signal.getsignal(signal.SIGINT)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        self.assertTrue(handlers)
+        self.assertTrue(all(h is signal.default_int_handler for h in handlers))
+        self.assertIs(after, signal.SIG_IGN)  # the caller's handler is back after the questions
 
 
 class ReportNoTtyTest(unittest.IsolatedAsyncioTestCase):

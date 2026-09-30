@@ -11,6 +11,7 @@ import os
 from pathlib import Path, PurePosixPath
 import plistlib
 import re
+import signal
 import stat
 import struct
 import sys
@@ -1550,6 +1551,17 @@ def report_text(info, rows, diag, answers, region=''):
     return '\n'.join(lines)
 
 
+@contextlib.contextmanager
+def plain_ctrl_c():
+    # asyncio.run turns the first Ctrl-C into a cancel of the main task, which a blocking input()
+    # never sees: the question keeps waiting and the cancel fires later, after the report is done.
+    try: previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    except ValueError: previous = None  # not the main thread
+    try: yield
+    finally:
+        if previous is not None: signal.signal(signal.SIGINT, previous)
+
+
 async def run_report(device, args, rows):
     out = args.runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'report')
     out.mkdir(parents=True, mode=0o700)
@@ -1561,12 +1573,15 @@ async def run_report(device, args, rows):
     if sys.stdin.isatty():
         print('\nЧто вы проверили сами? «д» — да, «н» — нет, Enter — не проверял.', flush=True)
         try:
-            for r in rows:
-                if r.get('Slot') not in SLOT_NAMES: continue
-                print('\n  ' + sim_header(r), flush=True)
-                answers[r['Slot']] = [report_answer(input(f'  {q}: ')) for q in REPORT_QUESTIONS]
-            # Free text, not a yes/no answer: «н» here is not «нет».
-            region = mask_log(input('\n  Город или регион (необязательно, Enter — пропустить): ').strip())[:60]
+            with plain_ctrl_c():
+                for r in rows:
+                    if r.get('Slot') not in SLOT_NAMES: continue
+                    print('\n  ' + sim_header(r), flush=True)
+                    # Stored one by one: an interrupted SIM keeps the answers already given.
+                    given = answers[r['Slot']] = []
+                    for q in REPORT_QUESTIONS: given.append(report_answer(input(f'  {q}: ')))
+                # Free text, not a yes/no answer: «н» here is not «нет».
+                region = mask_log(input('\n  Город или регион (необязательно, Enter — пропустить): ').strip())[:60]
         except (EOFError, KeyboardInterrupt):
             # The log is already collected: finish the report with the answers given so far.
             interrupted = True
