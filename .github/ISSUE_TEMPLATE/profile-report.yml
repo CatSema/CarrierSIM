@@ -1,0 +1,23 @@
+name: Отчёт о профиле
+description: Как профиль работает у вашего оператора — для общей таблицы оператор × профиль
+title: "Отчёт: <оператор> + <профиль>"
+labels: [profile-report]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Запустите CarrierSIM, пункт меню **11** (или `--report`), ответьте на вопросы и вставьте блок целиком.
+        Номер, IMSI и ICCID в отчёт не попадают. Проверяйте звонки на деле: наличие переключателя ещё не значит, что функция работает.
+  - type: textarea
+    id: report
+    attributes:
+      label: Отчёт
+      description: Всё между «===== Отчёт» и «===== конец отчёта»
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Что ещё заметили
+      description: Например, звонок рвётся при переходе с Wi-Fi на LTE, профиль сам откатился, пришлось переподключать услугу у оператора

@@ -1131,7 +1131,7 @@ def transient_error(error):
 async def execute_with_retry(args,assets):
     # Once selected, reconnect only to this exact phone, even if a different phone appears.
     args.udid=await choose_device(args.udid,args.wait_seconds)
-    if args.diagnose or args.watch_call:
+    if args.diagnose or args.watch_call or args.report:
         # Read-only: no retries and no auto-recovery, which would write to the phone.
         return await diagnostics(args)
     for attempt in range(1,args.attempts+1):
@@ -1509,6 +1509,81 @@ async def run_watch_call(device, args, rows):
     return 0
 
 
+# What only the user can check by hand; the log shows registration, not whether a call really works.
+REPORT_QUESTIONS = (
+    'VoWiFi: звонок в авиарежиме по Wi-Fi проходит',
+    'VoWiFi: включается сам, без авиарежима',
+    'VoLTE: без Wi-Fi звонок остаётся в 4G/5G',
+    '5G: полоса n в *3001#12345#* (например n1; «н» — полос n нет)',
+    'iMessage/FaceTime работают с номера',
+    'SMS в авиарежиме по Wi-Fi',
+    'Режим модема',
+    'Объединение и удержание вызовов',
+)
+
+
+def report_answer(text):
+    text = mask_log(text.strip())[:60]
+    if not text: return 'не проверял'
+    low = text.lower()
+    if low in ('д', 'да', 'y', 'yes', '+'): return 'да'
+    if low in ('н', 'нет', 'n', 'no', '-'): return 'нет'
+    return text
+
+
+def report_text(info, rows, diag, answers, region=''):
+    # Shareable: model, iOS, operator, the bundle iOS loaded, masked log summary and the user's answers.
+    lines = [f'CarrierSIM {VERSION} · отчёт о профиле',
+             f"{MODELS.get(info.get('ProductType'), {}).get('name', info.get('ProductType'))} · "
+             f"iOS {info.get('ProductVersion')} ({info.get('BuildVersion')})" + (f' · {region}' if region else '')]
+    for r in rows:
+        if r.get('Slot') not in SLOT_NAMES: continue
+        plmn = f"{r.get('MCC', '')}-{r.get('MNC', '')}"
+        bundle = str(r.get('CFBundleIdentifier', '')).removeprefix('com.apple.') or 'неизвестно'
+        lines.append(f"{SLOT_NAMES[r['Slot']]} · {OPERATORS.get(plmn, plmn)} ({plmn}) · профиль {bundle} "
+                     f"{r.get('CFBundleVersion', '')}".rstrip())
+        for question, answer in zip(REPORT_QUESTIONS, (answers or {}).get(r['Slot'], ())):
+            lines.append(f'    {question.split(" (")[0]}: {answer}')
+    if answers is None:
+        lines.append('Ручные проверки: не заданы (запуск без терминала)')
+    lines.append('Журнал CommCenter:' + (diag or '\n  нет данных'))
+    return '\n'.join(lines)
+
+
+async def run_report(device, args, rows):
+    out = args.runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'report')
+    out.mkdir(parents=True, mode=0o700)
+    print(f'Собираю журнал CommCenter {args.seconds} с. Включите и через 10 секунд выключите авиарежим '
+          '(Wi-Fi оставьте включённым).', flush=True)
+    state = {}
+    await commcenter_stream(device, args.seconds, out / 'commcenter.log', diag_collect(state))
+    answers = {}; region = ''; interrupted = False
+    if sys.stdin.isatty():
+        print('\nЧто вы проверили сами? «д» — да, «н» — нет, Enter — не проверял.', flush=True)
+        try:
+            for r in rows:
+                if r.get('Slot') not in SLOT_NAMES: continue
+                print('\n  ' + sim_header(r), flush=True)
+                answers[r['Slot']] = [report_answer(input(f'  {q}: ')) for q in REPORT_QUESTIONS]
+            # Free text, not a yes/no answer: «н» here is not «нет».
+            region = mask_log(input('\n  Город или регион (необязательно, Enter — пропустить): ').strip())[:60]
+        except (EOFError, KeyboardInterrupt):
+            # The log is already collected: finish the report with the answers given so far.
+            interrupted = True
+            print('\nВопросы прерваны, отчёт собираю с тем, что уже ответили.', flush=True)
+    else:
+        answers = None  # not asked at all, unlike a phone without SIM slots
+        print('\nВопросы о ручных проверках пропущены: запуск не из терминала. '
+              'Чтобы ответить, запустите пункт 11 из меню.', flush=True)
+    text = report_text(DIAG.get('info', {}), rows, diag_report(state, rows), answers, region)
+    if interrupted: text += '\nРучные проверки: вопросы прерваны, ответы неполные'
+    (out / 'report.txt').write_text(text + '\n', encoding='utf-8')
+    print('\n===== Отчёт: скопируйте всё до конца блока в тему или issue =====\n' + text +
+          '\n===== конец отчёта =====\n'
+          f'Номер, IMSI и ICCID в отчёт не попадают. Файл: {out / "report.txt"}', flush=True)
+    return 0
+
+
 async def diagnostics(args):
     device=await ready_device(args.udid,args.wait_seconds)
     try:
@@ -1518,7 +1593,7 @@ async def diagnostics(args):
         for r in rows:
             if r.get('Slot') in SLOT_NAMES: print('  '+sim_header(r),flush=True)
         print(flush=True)
-        return await (run_diagnose if args.diagnose else run_watch_call)(device,args,rows)
+        return await (run_diagnose if args.diagnose else run_report if args.report else run_watch_call)(device,args,rows)
     finally:await device.close()
 
 
@@ -1959,6 +2034,7 @@ def main():
     group.add_argument('--restore',action='store_true',help='удалить ссылки по IMSI и включить штатный выбор профилей; с --sims 1 или 2 только для этой SIM')
     group.add_argument('--restore-backup',type=Path,metavar='КАТАЛОГ',help='дополнительно: вернуть каталог из конкретной резервной копии')
     group.add_argument('--recover',type=Path,nargs='?',const=Path('AUTO'),metavar='ЭТАП',help='восстановиться после сбоя автоматически; путь к этапу необязателен')
+    group.add_argument('--report',action='store_true',help='обезличенный отчёт о профиле для таблицы: журнал CommCenter + что вы проверили сами; только чтение')
     group.add_argument('--diagnose',action='store_true',help='отчёт по SIM: IMS, VoLTE/VoWiFi/VoNR, роуминг, сеть, 5G SA; только чтение журнала')
     group.add_argument('--watch-call',action='store_true',help='слушать журнал во время тестового звонка: кодек (EVS/AMR), канал; только чтение')
     parser.add_argument('--bundle',metavar='ПАКЕТ',
@@ -1967,7 +2043,7 @@ def main():
                         help='какие SIM менять (установка и --restore): 1, 2 или all — все найденные (по умолчанию)')
     parser.add_argument('--trigger',type=Path,metavar='IPCC',help='свой подписанный IPCC вместо комплектного; плата и SIM проверяются')
     parser.add_argument('--attempts',type=int,default=3,metavar='N',help='попытки при временном сбое связи (по умолчанию 3)')
-    parser.add_argument('--seconds',type=int,metavar='СЕК',help='длительность --diagnose (по умолчанию 90) или --watch-call (по умолчанию 180)')
+    parser.add_argument('--seconds',type=int,metavar='СЕК',help='длительность --diagnose и --report (по умолчанию 90) или --watch-call (по умолчанию 180)')
     parser.add_argument('--wait-seconds',type=int,default=180,metavar='СЕК',help='ожидать подключение и разблокировку (по умолчанию 180 секунд)')
     parser.add_argument('--udid',metavar='ID',help='выбрать iPhone, если подключено несколько')
     parser.add_argument('--wifi',action='store_true',help='подключаться по Wi-Fi вместо кабеля (медленнее); нужны доверие и «Показывать iPhone при Wi-Fi», включённые заранее через кабель')
