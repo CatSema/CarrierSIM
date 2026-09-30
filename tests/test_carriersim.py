@@ -138,6 +138,29 @@ class SimsTest(unittest.TestCase):
         self.rows[1].pop('InternationalMobileSubscriberIdentity')
         self.assertEqual(len(carrier.select_sims(self.rows, slots=('kOne',))), 1)
 
+    def test_default_profile_skips_foreign_sim_unless_named_or_picked(self):
+        foreign = dict(Slot='kTwo', MCC='262', MNC='01')  # no IMSI needed for a SIM left alone
+        config = {'default': 'Vodafone_hu.bundle'}
+        skipped = []
+        result = carrier.select_sims([self.rows[0], foreign], config, any_mcc=False, skipped=skipped)
+        self.assertEqual([s['slot'] for s in result], ['kOne'])
+        self.assertEqual(skipped, ['kTwo'])
+        foreign['InternationalMobileSubscriberIdentity'] = '262011234567890'
+        named = carrier.select_sims([foreign], dict(config, **{'26201': 'O2_Germany.bundle'}), any_mcc=False)
+        self.assertEqual(named[0]['bundle'], 'O2_Germany.bundle')
+        picked = carrier.select_sims([foreign], config, ('kTwo',), any_mcc=True)
+        self.assertEqual(picked[0]['bundle'], 'Vodafone_hu.bundle')
+        with self.assertRaises(RuntimeError):
+            carrier.select_sims([foreign], config, any_mcc=False, skipped=[])
+        status_skipped = []  # --status only reads: the plan still shows "не трогаю"
+        self.assertEqual(carrier.select_sims([foreign], config, any_mcc=False, skipped=status_skipped,
+                                             only_skipped_ok=True), [])
+        self.assertEqual(status_skipped, ['kTwo'])
+        self.assertEqual(carrier.bundle_for('25701', config), 'Vodafone_hu.bundle')
+        blank = dict(Slot='kOne', MCC='', MNC='')  # locked phone: not a foreign SIM, an error
+        with self.assertRaisesRegex(RuntimeError, 'разблокируйте'):
+            carrier.select_sims([blank], config, any_mcc=False, skipped=[])
+
     def test_plan_changes_only_selected_imsi_and_preserves_original(self):
         original = {'25001': ('l', b'existing'), 'Info.plist': ('f', b'data')}
         sims = carrier.select_sims(self.rows, slots=('kTwo',))
