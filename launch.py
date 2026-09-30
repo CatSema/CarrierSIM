@@ -204,7 +204,7 @@ def main():
             elif code:
                 print('\nДействие не завершено. Причина указана выше.')
         except Exception as error:
-            print('\nОшибка запуска:', error)
+            print('\nОшибка запуска:', str(error).strip() or type(error).__name__)
         input('\nНажмите Enter, чтобы вернуться в главное меню…')
 
 
@@ -214,5 +214,5 @@ if __name__ == '__main__':
         print('\nЗапуск прерван. Если запись уже началась, сохраните runs и используйте восстановление.')
         sys.exit(130)
     except Exception as error:
-        print('Ошибка запуска:', error, file=sys.stderr)
+        print('Ошибка запуска:', str(error).strip() or type(error).__name__, file=sys.stderr)
         sys.exit(1)
