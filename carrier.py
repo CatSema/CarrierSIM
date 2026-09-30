@@ -932,6 +932,8 @@ def bundle_link(name):
 SLOT_NAMES = {'kOne': 'SIM 1', 'kTwo': 'SIM 2'}
 # Exit code for "written, but iOS did not confirm the chosen bundle"; 2 is argparse's usage error.
 UNCONFIRMED = 3
+# Exit code of --status for the menu's plan-then-confirm (CARRIERSIM_PLAN=1): nothing would be written.
+NOTHING_TO_WRITE = 4
 SLOT_CHOICES = {'1': ('kOne',), '2': ('kTwo',), 'all': ('kOne', 'kTwo')}
 
 
@@ -1627,10 +1629,13 @@ async def execute(args,assets):
         if args.status:
             print('Сверьте последние 4 цифры ICCID: Настройки → Основные → Об этом устройстве → ICCID нужной линии. '
                   '«сейчас» — профиль, загруженный iPhone; «план» — что будет записано.',flush=True)
-            if pending(args.runs,udid):
+            blocked=pending(args.runs,udid)
+            if blocked:
                 # Menu 7 confirms after this plan: say now that the write will not start, not after "да".
                 print('Внимание: прошлая операция на этом iPhone не завершилась, запись не начнётся. Сначала '
                       +recover_hint()+'.',flush=True)
+            # The menu must not ask "write?" when the write would not start or has nothing to write.
+            if os.environ.get('CARRIERSIM_PLAN') and (blocked or not sims): return NOTHING_TO_WRITE
             return
         custom=None
         if args.trigger:

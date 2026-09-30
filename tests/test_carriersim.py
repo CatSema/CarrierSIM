@@ -347,6 +347,20 @@ class VersionTest(unittest.TestCase):
             self.assertEqual(calls[0], ['--bundle', 'Vodafone_tr', '--sims', '2', '--status'])
             if runs == 2: self.assertEqual(calls[1], ['--bundle', 'Vodafone_tr', '--sims', '2'])
 
+    def test_other_profile_does_not_ask_when_the_plan_writes_nothing(self):
+        # menu: 7, bundle name, SIM 2, "press Enter", and 0 to quit — no confirmation question.
+        inputs = iter(['7', 'Vodafone_tr', '2', '', '0'])
+        with patch('builtins.input', lambda *_: next(inputs)), \
+                patch.object(launch, 'check_writable'), patch.object(launch, 'python_environment'), \
+                patch.object(launch, 'run_carrier', return_value=launch.NOTHING_TO_WRITE) as run, \
+                patch.object(sys, 'argv', ['launch.py']), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(launch.main(), 0)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.kwargs['env']['CARRIERSIM_PLAN'], '1')
+        self.assertIn('Записывать нечего', output.getvalue())
+        self.assertNotIn('Действие не завершено', output.getvalue())
+        self.assertEqual(launch.NOTHING_TO_WRITE, carrier.NOTHING_TO_WRITE)
+
     def test_log_environment_and_error_report_identify_version(self):
         with tempfile.TemporaryDirectory() as directory:
             run = pathlib.Path(directory)

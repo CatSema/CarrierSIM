@@ -15,6 +15,7 @@ from carriersim_version import VERSION
 
 ROOT = Path(__file__).resolve().parent
 UNCONFIRMED = 3  # carrier.py: written, but iOS did not confirm the chosen bundle
+NOTHING_TO_WRITE = 4  # carrier.py --status with CARRIERSIM_PLAN=1: the plan writes nothing
 
 
 def run_carrier(python, args, **kwargs):
@@ -210,8 +211,10 @@ def main():
         try:
             if python is None: python = python_environment()
             env = {**os.environ, 'CARRIERSIM_MENU': '1'}
-            code = run_carrier(python, [*args, '--status'], env=env) if confirm else 0
-            if confirm and not code and not ask_yes('\n  Записать этот профиль? Enter или «д» — да, «н» — нет: '):
+            code = run_carrier(python, [*args, '--status'], env={**env, 'CARRIERSIM_PLAN': '1'}) if confirm else 0
+            if code == NOTHING_TO_WRITE:
+                print('\n  Записывать нечего, установка не запущена. Причина указана выше.'); code = 0
+            elif confirm and not code and not ask_yes('\n  Записать этот профиль? Enter или «д» — да, «н» — нет: '):
                 print('Установка не запущена.')
             elif not code:
                 code = run_carrier(python, args, env=env)
