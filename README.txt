@@ -25,6 +25,18 @@ IMSI, операция останавливается до записи.
    подтвердите доверие компьютеру. Завершите синхронизацию Finder/iTunes.
    Кабель нужен для первого доверия; дальше можно по Wi-Fi (см. БЕЗ КАБЕЛЯ).
 
+БЕЗ PYTHON: ГОТОВАЯ СБОРКА
+К релизу прикладываются CarrierSIM-vN-macOS-arm64.zip, -macOS-x86_64.zip и
+-Windows-x64.zip: Python и библиотеки внутри, пункты 2 и 3 ПОДГОТОВКИ про
+Python не нужны (iTunes x64 на Windows нужен). Собраны GitHub Actions из того
+же тега; проверка: gh attestation verify ФАЙЛ.zip -R ios-bundles/CarrierSIM.
+Распакуйте архив целиком: bundle.yaml, assets.zip и runs лежат рядом с
+CarrierSIM (CarrierSIM.exe). macOS: сборка не подписана Apple, поэтому один раз
+выполните в Терминале xattr -dr com.apple.quarantine ПАПКА_CarrierSIM, затем
+запускайте CarrierSIM двойным щелчком. Меню и флаги те же, что у скрипта.
+Сборка macOS arm64 проверена без телефона; Windows и Intel Mac на железе не
+запускались.
+
 БЫСТРЫЙ ЗАПУСК ДВОЙНЫМ ЩЕЛЧКОМ
 macOS: Запуск macOS.command
 Windows: Запуск Windows.cmd
