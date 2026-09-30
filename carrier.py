@@ -903,6 +903,71 @@ def native_host(udid, assets, directories):
         host.close()
 
 
+LOCAL_NETWORK_HINT = ('macOS не пускает этот терминал в локальную сеть, а AirTraffic по Wi-Fi соединяется '
+    'с iPhone напрямую. Разрешите терминалу доступ: «Системные настройки → Конфиденциальность и безопасность → '
+    'Локальная сеть». Из tmux, screen или SSH macOS разрешения не спрашивает: запустите «Запуск macOS.command» '
+    'из Finder или обычное окно терминала, либо подключите кабель и переключите связь на кабель (пункт 10). '
+    'Если разрешение уже есть, проверьте, что iPhone в той же сети Wi-Fi и не спит')
+
+
+# macOS refuses a denied connect in about 1 ms; a real "no route" takes neighbor discovery's seconds.
+LOCAL_NETWORK_REFUSAL = 0.5
+
+
+def usbmux_network_address(udid):
+    # pymobiledevice3 drops NetworkAddress from its device list, so ask usbmuxd directly: the system
+    # socket, which Apple's MobileDevice uses too. None also when the phone is on USB as well: then
+    # MobileDevice picks the cable and the direct Wi-Fi path does not matter.
+    import socket
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(5); s.connect('/var/run/usbmuxd')
+        body = plistlib.dumps({'MessageType': 'ListDevices', 'ProgName': 'CarrierSIM', 'ClientVersionString': VERSION})
+        s.sendall(struct.pack('<IIII', 16 + len(body), 1, 8, 1) + body)
+        def read(n):
+            data = b''
+            while len(data) < n:
+                chunk = s.recv(n - len(data)); require(chunk, 'usbmuxd закрыл соединение')
+                data += chunk
+            return data
+        devices = plistlib.loads(read(struct.unpack('<I', read(16)[:4])[0] - 16)).get('DeviceList', [])
+    mine = [d.get('Properties', {}) for d in devices if d.get('Properties', {}).get('SerialNumber') == udid]
+    if any(p.get('ConnectionType') == 'USB' for p in mine): return None
+    return next((sockaddr(p['NetworkAddress']) for p in mine
+                 if p.get('ConnectionType') == 'Network' and p.get('NetworkAddress')), None)
+
+
+def sockaddr(raw):
+    # BSD sockaddr: length, family, port, then sockaddr_in or sockaddr_in6 fields.
+    import socket
+    if raw[1] == socket.AF_INET6:
+        return socket.AF_INET6, (socket.inet_ntop(socket.AF_INET6, raw[8:24]), 62078, 0,
+                                 int.from_bytes(raw[24:28], sys.byteorder))
+    if raw[1] == socket.AF_INET:
+        return socket.AF_INET, (socket.inet_ntop(socket.AF_INET, raw[4:8]), 62078)
+    return None
+
+
+def local_network_denied(udid):
+    # Over Wi-Fi, Apple's MobileDevice inside the AirTraffic host connects to the phone itself, not
+    # through usbmuxd. macOS "Local Network" privacy refuses that in 1 ms with EHOSTUNREACH, and the
+    # host then waits silently until its deadline, while pymobiledevice3 (via usbmuxd) keeps working.
+    # Only a definite refusal counts: any other outcome lets the run go on. A phone that is really
+    # unreachable gives the same errno, but only after neighbor discovery gives up (seconds).
+    import socket
+    if sys.platform != 'darwin': return False
+    started = None
+    try:
+        address = usbmux_network_address(udid)
+        if address is None: return False
+        with socket.socket(address[0], socket.SOCK_STREAM) as s:
+            s.settimeout(3); started = time.monotonic(); s.connect(address[1])
+    except OSError as error:
+        return error.errno == 65 and started is not None and time.monotonic() - started < LOCAL_NETWORK_REFUSAL  # EHOSTUNREACH
+    except Exception:
+        return False
+    return False
+
+
 def host_command():
     return [sys.executable, '--carrier', '--_host'] if FROZEN else [sys.executable, str(SELF), '--_host']
 
@@ -1284,6 +1349,9 @@ async def execute_with_retry(args,assets):
     if args.diagnose or args.watch_call or args.report:
         # Read-only: no retries and no auto-recovery, which would write to the phone.
         return await diagnostics(args)
+    if CONNECTION=='Network' and not args.status:
+        # Before any stage: AirTraffic (install and rollback alike) needs a direct connection.
+        require(not await asyncio.to_thread(local_network_denied,args.udid),LOCAL_NETWORK_HINT)
     for attempt in range(1,args.attempts+1):
         print(f'Попытка {attempt} из {args.attempts}',flush=True)
         before=set(pending(args.runs,args.udid))
