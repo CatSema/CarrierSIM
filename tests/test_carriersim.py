@@ -278,6 +278,15 @@ class RetryTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.args.udid, 'phone')
 
 
+class OutcomeTest(unittest.TestCase):
+    def test_rescan_outcome_names_what_ios_chose(self):
+        r = lambda selected, verified=True: {'expected': 'Vodafone_tr.bundle', 'selected': selected, 'verified': verified}
+        self.assertEqual(carrier.slot_outcome(r('Vodafone_tr.bundle'), True), 'Vodafone_tr — подпись принята')
+        self.assertEqual(carrier.slot_outcome(r('MTS_ru.bundle'), False), 'iOS выбрала MTS_ru вместо Vodafone_tr')
+        self.assertIn('нет выбора пакета', carrier.slot_outcome(r(None, False), False))
+        self.assertIn('подпись не принята', carrier.slot_outcome(r('Vodafone_tr.bundle', False), False))
+
+
 class VersionTest(unittest.TestCase):
     def test_cli_version_and_help_work_without_apple_services(self):
         for flag, expected in (('--version', f'CarrierSIM {VERSION}'), ('--help', '--recover')):
