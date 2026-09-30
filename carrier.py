@@ -1390,10 +1390,21 @@ def sip_assembler():
     return feed
 
 
+# syslog() pid meaning "every process": the CommCenter lines are then picked by executable path.
+ALL_PROCESSES = -1
+
+
 async def commcenter_pid(device):
+    from pymobiledevice3.exceptions import ConnectionTerminatedError
     from pymobiledevice3.services.os_trace import OsTraceService
-    async with OsTraceService(device) as service:
-        pids = (await service.get_pid_list()).get('Payload', {})
+    try:
+        async with OsTraceService(device) as service:
+            pids = (await service.get_pid_list()).get('Payload', {})
+    except ConnectionTerminatedError:
+        # Over Wi-Fi iOS 27 closes the socket on the ~16 KB process list every time,
+        # while the unfiltered log itself streams fine.
+        print('iPhone не отдал список процессов, беру весь журнал и отбираю CommCenter на компьютере.', flush=True)
+        return ALL_PROCESSES
     return next((int(p) for p, v in pids.items() if v.get('ProcessName') == 'CommCenter'), None)
 
 
@@ -1423,7 +1434,7 @@ async def commcenter_stream(device, seconds, log_path, on_entry):
                                      max(0, down_since + LOG_RECONNECT_SECONDS - loop.time()))
             try:
                 async with window, budget:
-                    if down_since is not None:
+                    if down_since is not None and pid != ALL_PROCESSES:
                         # CommCenter may have restarted: look its pid up again.
                         pid = await commcenter_pid(device)
                         if pid is None: raise ConnectionTerminatedError('CommCenter is not running yet')
@@ -1431,6 +1442,7 @@ async def commcenter_stream(device, seconds, log_path, on_entry):
                         async for e in service.syslog(pid=pid):
                             if down_since is not None:
                                 reconnects += 1; down_since = None; budget.reschedule(None)
+                            if pid == ALL_PROCESSES and not e.filename.endswith('/CommCenter'): continue
                             received += 1
                             msg = mask_log(e.message)
                             cat = f'{e.label.subsystem}:{e.label.category}' if e.label else '-'

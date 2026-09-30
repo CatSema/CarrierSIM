@@ -280,12 +280,16 @@ class RetryTest(unittest.IsolatedAsyncioTestCase):
 
 class LogStreamTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod
-    def entry(text):
-        return SimpleNamespace(message=text, label=None, timestamp=__import__('datetime').datetime(2026, 9, 30))
+    def entry(text, filename='/System/Library/Frameworks/CoreTelephony.framework/Support/CommCenter'):
+        return SimpleNamespace(message=text, label=None, filename=filename,
+                               timestamp=__import__('datetime').datetime(2026, 9, 30))
 
     async def collect(self, plan, seconds=0.5, pids=None, on_entry=None):
-        # plan: one item per syslog() call — a list of texts, optionally ending in an exception to raise.
-        plan = list(plan); pids = list(pids or []); seen = []
+        # plan: one item per syslog() call — a list of texts (or (text, filename)), optionally ending in an exception.
+        # pids: one item per get_pid_list() call — True, False (no CommCenter) or an exception to raise.
+        plan = list(plan); pids = list(pids or []); seen = []; self.syslog_pids = []
+
+        test = self
 
         class FakeTrace:
             def __init__(self, device): pass
@@ -293,12 +297,14 @@ class LogStreamTest(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *a): return False
             async def get_pid_list(self):
                 found = pids.pop(0) if pids else True
+                if isinstance(found, BaseException): raise found
                 return {'Payload': {'42': {'ProcessName': 'CommCenter'}} if found else {}}
             async def syslog(self, pid):
+                test.syslog_pids.append(pid)
                 step = plan.pop(0) if plan else []
                 for item in step:
                     if isinstance(item, BaseException): raise item
-                    yield LogStreamTest.entry(item)
+                    yield LogStreamTest.entry(*item) if isinstance(item, tuple) else LogStreamTest.entry(item)
                 await asyncio.Event().wait()
 
         with tempfile.TemporaryDirectory() as directory, \
@@ -324,6 +330,15 @@ class LogStreamTest(unittest.IsolatedAsyncioTestCase):
         # pids: initial lookup, then "not running yet", then found again.
         seen, out = await self.collect([['before', ConnectionTerminatedError()], ['after']], pids=[True, False, True])
         self.assertEqual(seen, ['before', 'after'])
+
+    async def test_process_list_refused_over_wifi_streams_all_and_keeps_commcenter(self):
+        from pymobiledevice3.exceptions import ConnectionTerminatedError
+        seen, out = await self.collect([['before', ('noise', '/usr/libexec/locationd'), ConnectionTerminatedError()],
+                                        ['after']], pids=[ConnectionTerminatedError()])
+        self.assertEqual(seen, ['before', 'after'])
+        # The refused list is not asked for again on reconnect: both streams are unfiltered.
+        self.assertEqual(self.syslog_pids, [carrier.ALL_PROCESSES] * 2)
+        self.assertIn('переподключений: 1', out)
 
     async def test_fatal_error_is_not_swallowed(self):
         from pymobiledevice3.exceptions import NotPairedError
