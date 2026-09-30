@@ -278,6 +278,48 @@ class RetryTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.args.udid, 'phone')
 
 
+class CatalogTest(unittest.TestCase):
+    CATALOG = {'meta': {'ios': '27.0', 'deviceName': 'iPhone 17'},
+               'bundles': [{'b': 'Vodafone_tr', 'country': 'Turkey', 'reg': '13191', 'ih': 'cellular', 'wroam': True,
+                            'wn': 'vodafone TR Wi-Fi', 'lte': '4G', 'vs': False, 'evs': True, 'xcap': True, 'vvm': 'none'},
+                           {'b': 'Vodafone_ro', 'reg': '+447786205094', 'ih': 'ims', 'wroam': False},
+                           {'b': 'Exit_zero', 'reg': '00447786205094'}]}
+
+    def load(self):
+        with tempfile.TemporaryDirectory() as runs:
+            pathlib.Path(runs, 'bundles.json').write_text(json.dumps(self.CATALOG), encoding='utf-8')
+            with patch('urllib.request.urlopen', side_effect=AssertionError('fresh cache must not be refetched')):
+                return carrier.load_catalog(runs)
+
+    def test_passport_from_cache_warns_about_short_imessage_number(self):
+        catalog = self.load()
+        text = '\n'.join(carrier.passport_lines('Vodafone_tr.bundle', catalog))
+        self.assertIn('местный номер 13191', text)
+        self.assertIn('в роуминге — да', text)
+        self.assertIn('приоритет дома — сотовая', text)
+        self.assertIn('международный номер', '\n'.join(carrier.passport_lines('Vodafone_ro', catalog)))
+        self.assertIn('Похожие: Vodafone_tr', carrier.passport_lines('Vodafon_tr', catalog)[0])
+        self.assertIn('международный номер', '\n'.join(carrier.passport_lines('Exit_zero', catalog)))
+
+    def test_case_only_mismatch_is_an_error_and_missing_catalog_is_silent(self):
+        catalog = self.load()
+        self.assertIn('Vodafone_tr', carrier.catalog_name_error('vodafone_TR.bundle', catalog))
+        self.assertIsNone(carrier.catalog_name_error('Vodafone_tr.bundle', catalog))
+        self.assertFalse(carrier.catalog_name_error('Unknown_xx', catalog))
+        self.assertIsNone(carrier.catalog_name_error('vodafone_tr', None))
+        self.assertEqual(carrier.passport_lines('Vodafone_tr', None), [])
+        with tempfile.TemporaryDirectory() as runs, \
+                patch('urllib.request.urlopen', side_effect=OSError('offline')):
+            self.assertIsNone(carrier.load_catalog(runs))
+
+    def test_downloaded_table_is_cached_atomically(self):
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(self.CATALOG).encode()
+        with tempfile.TemporaryDirectory() as runs, patch('urllib.request.urlopen', return_value=response):
+            self.assertIsNotNone(carrier.load_catalog(runs))
+            self.assertEqual([p.name for p in pathlib.Path(runs).iterdir()], ['bundles.json'])
+
+
 class VersionTest(unittest.TestCase):
     def test_cli_version_and_help_work_without_apple_services(self):
         for flag, expected in (('--version', f'CarrierSIM {VERSION}'), ('--help', '--recover')):
@@ -290,6 +332,20 @@ class VersionTest(unittest.TestCase):
         with patch('builtins.input', return_value='0'), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertIsNone(launch.menu())
         self.assertIn(f'CarrierSIM {VERSION}', output.getvalue())
+
+    def test_other_profile_shows_plan_and_writes_only_after_yes(self):
+        for answer, runs in (('', 2), ('д', 2), ('н', 1)):
+            # menu: 7, bundle name, SIM 2, then the confirmation, "press Enter", and 0 to quit.
+            inputs = iter(['7', 'Vodafone_tr', '2', answer, '', '0'])
+            with self.subTest(answer=answer), patch('builtins.input', lambda *_: next(inputs)), \
+                    patch.object(launch, 'check_writable'), patch.object(launch, 'python_environment'), \
+                    patch.object(launch, 'run_carrier', return_value=0) as run, patch.object(sys, 'argv', ['launch.py']), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(launch.main(), 0)
+            calls = [c.args[1] for c in run.call_args_list]
+            self.assertEqual(len(calls), runs)
+            self.assertEqual(calls[0], ['--bundle', 'Vodafone_tr', '--sims', '2', '--status'])
+            if runs == 2: self.assertEqual(calls[1], ['--bundle', 'Vodafone_tr', '--sims', '2'])
 
     def test_log_environment_and_error_report_identify_version(self):
         with tempfile.TemporaryDirectory() as directory:

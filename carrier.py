@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import hashlib
 import io
 import json
@@ -958,6 +959,76 @@ def bundle_for(plmn, config):
     return config.get(plmn) or config.get('default') or BUNDLE
 
 
+# Bundle properties extracted from an IPSW by ios-bundles.github.io; file contents, not device tests.
+CATALOG_URL = 'https://ios-bundles.github.io/data.json'
+CATALOG_MAX_AGE = 7 * 24 * 3600
+
+
+@functools.lru_cache(maxsize=None)
+def load_catalog(runs):
+    # A fresh cache, else the site, else a stale cache; None when nothing is available. Never fatal.
+    cache = Path(runs) / 'bundles.json'
+    try:
+        fresh = cache.exists() and time.time() - cache.stat().st_mtime < CATALOG_MAX_AGE
+        if not fresh:
+            import ssl, urllib.request
+            try:
+                import certifi
+                context = ssl.create_default_context(cafile=certifi.where())
+            except ImportError:
+                context = ssl.create_default_context()
+            with urllib.request.urlopen(CATALOG_URL, timeout=5, context=context) as response:
+                data = response.read(8 << 20)
+            json.loads(data)['bundles']
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            # Atomic: a torn file with a fresh mtime would pass as a valid cache for a week.
+            tmp = cache.with_suffix('.tmp'); tmp.write_bytes(data); tmp.replace(cache)
+    except Exception:
+        pass
+    try:
+        catalog = json.loads(cache.read_text(encoding='utf-8'))
+        return {'meta': catalog.get('meta', {}), 'bundles': {r['b']: r for r in catalog['bundles']}}
+    except Exception:
+        return None
+
+
+def catalog_name_error(name, catalog):
+    # Bundle names are case-sensitive on the phone; a case-only mismatch would cost a whole install cycle.
+    name = name.removesuffix('.bundle')
+    if not catalog or name in catalog['bundles']: return None
+    same = [b for b in catalog['bundles'] if b.lower() == name.lower()]
+    return same and f'Пакета {name} нет, но есть {same[0]}: регистр букв важен. Укажите {same[0]}.'
+
+
+def passport_lines(name, catalog):
+    name = name.removesuffix('.bundle')
+    if not catalog: return []
+    meta = catalog['meta']; r = catalog['bundles'].get(name)
+    where = f"iOS {meta.get('ios', '?')}, {meta.get('deviceName', '?')}"
+    if r is None:
+        import difflib
+        near = difflib.get_close_matches(name, catalog['bundles'], 3, 0.6)
+        return [f'  {name}: нет в таблице пакетов ({where}); в вашей iOS пакет может быть или не быть.'
+                + (' Похожие: ' + ', '.join(near) + '.' if near else '')]
+    yn = lambda v, unset='не задано': 'да' if v is True else 'нет' if v is False else unset
+    pref = lambda v: {'wifi': 'Wi-Fi', 'ims': 'Wi-Fi', 'cellular': 'сотовая'}.get(v, 'не задан')
+    reg = str(r.get('reg') or '')
+    # International: an exit prefix (+, 00, 011) and a full number; anything else is local to the bundle's country.
+    imessage = ('международный номер' if re.fullmatch(r'(?:\+|00|011)\d{7,}', reg) else
+                f'местный номер {reg} другой страны: из российской сети недоступен, повторная активация '
+                'по номеру может не пройти' if reg else 'номер не задан')
+    lines = [f"  {name} ({r.get('country') or '?'}) — по файлу пакета, {where}, не проверка на телефоне:",
+             f"    VoWiFi: приоритет дома — {pref(r.get('ih'))}, в роуминге — {yn(r.get('wroam'))}"
+             + (f", подпись «{r['wn']}»" if r.get('wn') else ''),
+             f"    iMessage/FaceTime: {imessage}",
+             f"    значок {r.get('lte') or 'LTE'} · переключатель VoLTE {'нет' if r.get('vs') is False else 'есть'}"
+             f" · 5G {'скрыт' if r.get('sw5g') is False else 'есть'} · EVS {'есть' if r.get('evs') else 'нет'}"
+             f" · доп. услуги по IMS (XCAP) {yn(r.get('xcap'))}"]
+    if r.get('vvm') and r.get('vvm') != 'none':
+        lines.append(f"    визуальная голосовая почта: служебные SMS уходят на номер {r.get('beacon') or 'чужого оператора'}")
+    return lines
+
+
 OPERATORS = {'232-05': 'One', '250-01': 'МТС', '250-02': 'МегаФон', '250-11': 'Yota', '250-20': 'T2',
              '250-99': 'Билайн', '257-01': 'A1', '257-02': 'МТС BY', '257-04': 'life:)'}
 
@@ -1545,9 +1616,21 @@ async def execute(args,assets):
             target='штатный профиль' if args.restore else s['bundle'].removesuffix('.bundle')+' (по IMSI)'
             print(f"  {sim_line(row_by_slot[s['slot']],top)}  →  план: {target}",flush=True)
         print(flush=True)
+        bundles=sorted({s['bundle'] for s in sims if s['bundle']})
+        if bundles:
+            # Blocking I/O off the event loop; cached per process, so retries do not wait again.
+            catalog=await asyncio.to_thread(load_catalog,args.runs)
+            for name in bundles:
+                error=catalog_name_error(name,catalog);require(not error,error)
+                for line in passport_lines(name,catalog): print(line,flush=True)
+            if catalog: print(flush=True)
         if args.status:
             print('Сверьте последние 4 цифры ICCID: Настройки → Основные → Об этом устройстве → ICCID нужной линии. '
                   '«сейчас» — профиль, загруженный iPhone; «план» — что будет записано.',flush=True)
+            if pending(args.runs,udid):
+                # Menu 7 confirms after this plan: say now that the write will not start, not after "да".
+                print('Внимание: прошлая операция на этом iPhone не завершилась, запись не начнётся. Сначала '
+                      +recover_hint()+'.',flush=True)
             return
         custom=None
         if args.trigger:
