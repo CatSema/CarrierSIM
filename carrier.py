@@ -852,7 +852,7 @@ def native_host(udid, assets, directories):
                 try:
                     name = host.decode(host.at.ATCFMessageGetName(msg))
                     try: body = json.dumps(host.decode(msg), ensure_ascii=False, default=str)[:4000]
-                    except Exception as e: body = 'не прочитано: ' + str(e)
+                    except Exception as e: body = 'не прочитано: ' + error_text(e)
                     framed({'event': 'message', 'name': name, 'body': body})
                     if name == wanted:
                         if name != 'AssetManifest': return True
@@ -1943,7 +1943,7 @@ def save_environment(run):
 def print_diagnostics(error):
     rows = []
     try: rows += environment_info()
-    except Exception as e: rows.append(('Окружение', f'не собрано: {e}'))
+    except Exception as e: rows.append(('Окружение', f'не собрано: {error_text(e)}'))
     info = DIAG.get('info')
     if info:
         rows.append(('iPhone', f"{MODELS.get(info['ProductType'], {}).get('name', '?')} · {info['ProductType']} · "
@@ -1960,7 +1960,7 @@ def print_diagnostics(error):
     if run:
         rows.append(('Папка операции', str(run)))
         try: rows += run_details(run)
-        except Exception as e: rows.append(('Журналы', f'не прочитаны: {e}'))
+        except Exception as e: rows.append(('Журналы', f'не прочитаны: {error_text(e)}'))
     rows.append(('Ошибка', error_line(error)))
     import traceback
     frames = [f for f in traceback.extract_tb(error.__traceback__) if f.filename.endswith(('carrier.py', 'launch.py'))]
@@ -2035,7 +2035,7 @@ def main():
     except Exception as error:
         # Recovery must not depend on the bundled triggers: they are only used for the final rescan.
         if not args.recover: raise
-        print(f'Предупреждение: assets.zip недоступен ({error}). Восстановление пройдёт без пересканирования.',flush=True)
+        print(f'Предупреждение: assets.zip недоступен ({error_text(error)}). Восстановление пройдёт без пересканирования.',flush=True)
         assets=None
     global APPLE_DIRS, CONNECTION
     if args.wifi: CONNECTION='Network'
