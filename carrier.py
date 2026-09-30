@@ -1349,7 +1349,9 @@ async def execute_with_retry(args,assets):
     if args.diagnose or args.watch_call or args.report:
         # Read-only: no retries and no auto-recovery, which would write to the phone.
         return await diagnostics(args)
-    if CONNECTION=='Network' and not args.status:
+    # "Nothing to recover" needs no AirTraffic: let it say so instead of stopping on the check.
+    idle_recover=args.recover==Path('AUTO') and not pending(args.runs,args.udid)
+    if CONNECTION=='Network' and not args.status and not idle_recover:
         # Before any stage: AirTraffic (install and rollback alike) needs a direct connection.
         require(not await asyncio.to_thread(local_network_denied,args.udid),LOCAL_NETWORK_HINT)
     for attempt in range(1,args.attempts+1):

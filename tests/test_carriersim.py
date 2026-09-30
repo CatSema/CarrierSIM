@@ -734,6 +734,19 @@ class LocalNetworkTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await carrier.execute_with_retry(args, {}), 0)
             check.assert_not_called()
 
+    async def test_nothing_to_recover_over_wifi_skips_the_check(self):
+        args = SimpleNamespace(udid=None, wait_seconds=1, diagnose=False, watch_call=False, report=False,
+                               attempts=1, runs=pathlib.Path('.'), status=False, recover=pathlib.Path('AUTO'))
+        for unresolved, checked in (([], False), (['stage'], True)):
+            with self.subTest(unresolved=unresolved), patch.object(carrier, 'CONNECTION', 'Network'), \
+                 patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
+                 patch.object(carrier, 'pending', return_value=unresolved), \
+                 patch.object(carrier, 'local_network_denied', return_value=False) as check, \
+                 patch.object(carrier, 'execute', AsyncMock(return_value=0)), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(await carrier.execute_with_retry(args, {}), 0)
+                self.assertEqual(check.called, checked)
+
 
 class VersionTest(unittest.TestCase):
     def test_cli_version_and_help_work_without_apple_services(self):
