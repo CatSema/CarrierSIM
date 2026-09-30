@@ -1394,7 +1394,7 @@ def sip_assembler():
 ALL_PROCESSES = -1
 
 
-async def commcenter_pid(device):
+async def commcenter_pid(device, first=False):
     from pymobiledevice3.exceptions import ConnectionTerminatedError
     from pymobiledevice3.services.os_trace import OsTraceService
     try:
@@ -1402,7 +1402,9 @@ async def commcenter_pid(device):
             pids = (await service.get_pid_list()).get('Payload', {})
     except ConnectionTerminatedError:
         # Over Wi-Fi iOS 27 closes the socket on the ~16 KB process list every time,
-        # while the unfiltered log itself streams fine.
+        # while the unfiltered log itself streams fine. Only before the first stream:
+        # on a reconnect the same error just means the relay is still down.
+        if not first: raise
         print('iPhone не отдал список процессов, беру весь журнал и отбираю CommCenter на компьютере.', flush=True)
         return ALL_PROCESSES
     return next((int(p) for p, v in pids.items() if v.get('ProcessName') == 'CommCenter'), None)
@@ -1419,7 +1421,7 @@ class LogSinkError(Exception):
 async def commcenter_stream(device, seconds, log_path, on_entry):
     from pymobiledevice3.exceptions import ConnectionTerminatedError
     from pymobiledevice3.services.os_trace import OsTraceService
-    pid = await commcenter_pid(device)
+    pid = await commcenter_pid(device, first=True)
     require(pid is not None, 'Процесс CommCenter не найден на iPhone.')
     # Airplane mode, which the instructions ask for, can end the log relay on the phone.
     # Reconnect until the deadline instead of losing the whole collection.
@@ -1458,16 +1460,16 @@ async def commcenter_stream(device, seconds, log_path, on_entry):
             except Exception as error:
                 # Our own deadline, not a socket timeout (which Python also reports as TimeoutError).
                 if isinstance(error, TimeoutError) and window.expired(): break
-                if isinstance(error, TimeoutError) and budget.expired():
-                    if received: break
-                    raise RuntimeError(f'Журнал iPhone недоступен больше {LOG_RECONNECT_SECONDS} с. '
-                                       'Проверьте кабель или Wi-Fi и повторите.') from error
-                if not transient_error(error): raise
-                if down_since is None:
-                    down_since = loop.time()
-                    if reset := getattr(on_entry, 'reset', None): reset()  # drop half-read SIP messages
-                    print('Журнал iPhone оборвался (так бывает при включении авиарежима), подключаюсь снова…', flush=True)
-                elif loop.time() - down_since > LOG_RECONNECT_SECONDS:
+                # The reconnect budget is spent: as its timeout, or by the clock when failures never yield to the loop.
+                gave_up = isinstance(error, TimeoutError) and budget.expired()
+                if not gave_up:
+                    if not transient_error(error): raise
+                    if down_since is None:
+                        down_since = loop.time()
+                        if reset := getattr(on_entry, 'reset', None): reset()  # drop half-read SIP messages
+                        print('Журнал iPhone оборвался (так бывает при включении авиарежима), подключаюсь снова…', flush=True)
+                    gave_up = loop.time() - down_since > LOG_RECONNECT_SECONDS
+                if gave_up:
                     # Over Wi-Fi airplane mode may take the whole connection down: keep what was collected.
                     if received: break
                     raise RuntimeError(f'Журнал iPhone недоступен больше {LOG_RECONNECT_SECONDS} с. '

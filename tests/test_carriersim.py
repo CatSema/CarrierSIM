@@ -340,6 +340,15 @@ class LogStreamTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.syslog_pids, [carrier.ALL_PROCESSES] * 2)
         self.assertIn('переподключений: 1', out)
 
+    async def test_refused_lookup_on_reconnect_is_a_drop_not_the_wifi_fallback(self):
+        from pymobiledevice3.exceptions import ConnectionTerminatedError
+        # Cable, airplane mode: the relay is still down when the pid is looked up again.
+        seen, out = await self.collect([['before', ConnectionTerminatedError()], ['after']],
+                                       pids=[True, ConnectionTerminatedError(), True])
+        self.assertEqual(seen, ['before', 'after'])
+        self.assertEqual(self.syslog_pids, [42, 42])
+        self.assertNotIn('список процессов', out)
+
     async def test_fatal_error_is_not_swallowed(self):
         from pymobiledevice3.exceptions import NotPairedError
         with self.assertRaises(NotPairedError):
