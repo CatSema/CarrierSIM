@@ -1545,24 +1545,102 @@ def sip_assembler():
         elif cat in bufs:
             bufs[cat].append(line)
         return None
+    feed.reset = bufs.clear  # after a log drop a half-read message must not merge with new lines
     return feed
 
 
-async def commcenter_stream(device, seconds, log_path, on_entry):
+# syslog() pid meaning "every process": the CommCenter lines are then picked by executable path.
+ALL_PROCESSES = -1
+
+
+async def commcenter_pid(device, first=False):
+    from pymobiledevice3.exceptions import ConnectionTerminatedError
     from pymobiledevice3.services.os_trace import OsTraceService
-    pids = (await OsTraceService(device).get_pid_list()).get('Payload', {})
-    pid = next((int(p) for p, v in pids.items() if v.get('ProcessName') == 'CommCenter'), None)
+    try:
+        async with OsTraceService(device) as service:
+            pids = (await service.get_pid_list()).get('Payload', {})
+    except ConnectionTerminatedError:
+        # Over Wi-Fi iOS 27 closes the socket on the ~16 KB process list every time,
+        # while the unfiltered log itself streams fine. Only before the first stream:
+        # on a reconnect the same error just means the relay is still down.
+        if not first: raise
+        print('iPhone не отдал список процессов, беру весь журнал и отбираю CommCenter на компьютере.', flush=True)
+        return ALL_PROCESSES
+    return next((int(p) for p, v in pids.items() if v.get('ProcessName') == 'CommCenter'), None)
+
+
+# How long the log may stay unreachable after a drop before the collection gives up.
+LOG_RECONNECT_SECONDS = 20
+
+
+class LogSinkError(Exception):
+    """A local failure (disk, parser) that must not look like a dropped log stream."""
+
+
+async def commcenter_stream(device, seconds, log_path, on_entry):
+    from pymobiledevice3.exceptions import ConnectionTerminatedError
+    from pymobiledevice3.services.os_trace import OsTraceService
+    pid = await commcenter_pid(device, first=True)
     require(pid is not None, 'Процесс CommCenter не найден на iPhone.')
+    # Airplane mode, which the instructions ask for, can end the log relay on the phone.
+    # Reconnect until the deadline instead of losing the whole collection.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    reconnects = 0; down_since = None; received = 0
     with log_path.open('w', encoding='utf-8') as f:
-        try:
-            async with asyncio.timeout(seconds):
-                async for e in OsTraceService(device).syslog(pid=pid):
-                    msg = mask_log(e.message)
-                    cat = f'{e.label.subsystem}:{e.label.category}' if e.label else '-'
-                    f.write(f'{e.timestamp:%H:%M:%S} [{cat}] {msg}\n')
-                    on_entry(e, msg)
-        except TimeoutError:
-            pass
+        while (left := deadline - loop.time()) > 0:
+            window = asyncio.timeout(left)
+            # After a drop the reconnect itself is bounded too: a hung connect over Wi-Fi must not eat the rest.
+            budget = asyncio.timeout(None if down_since is None else
+                                     max(0, down_since + LOG_RECONNECT_SECONDS - loop.time()))
+            try:
+                async with window, budget:
+                    if down_since is not None and pid != ALL_PROCESSES:
+                        # CommCenter may have restarted: look its pid up again.
+                        pid = await commcenter_pid(device)
+                        if pid is None: raise ConnectionTerminatedError('CommCenter is not running yet')
+                    async with OsTraceService(device) as service:
+                        async for e in service.syslog(pid=pid):
+                            if down_since is not None:
+                                reconnects += 1; down_since = None; budget.reschedule(None)
+                            if pid == ALL_PROCESSES and not e.filename.endswith('/CommCenter'): continue
+                            received += 1
+                            msg = mask_log(e.message)
+                            cat = f'{e.label.subsystem}:{e.label.category}' if e.label else '-'
+                            try:
+                                f.write(f'{e.timestamp:%H:%M:%S} [{cat}] {msg}\n')
+                                on_entry(e, msg)
+                            except Exception as error:
+                                raise LogSinkError() from error
+                    # pymobiledevice3 11.12.5 never ends syslog(); a finite stream would count as a drop.
+                    raise ConnectionTerminatedError('log relay ended')
+            except LogSinkError as error:
+                raise error.__cause__
+            except Exception as error:
+                # Our own deadline, not a socket timeout (which Python also reports as TimeoutError).
+                if isinstance(error, TimeoutError) and window.expired(): break
+                # The reconnect budget is spent: as its timeout, or by the clock when failures never yield to the loop.
+                gave_up = isinstance(error, TimeoutError) and budget.expired()
+                if not gave_up:
+                    if not transient_error(error): raise
+                    if down_since is None:
+                        down_since = loop.time()
+                        if reset := getattr(on_entry, 'reset', None): reset()  # drop half-read SIP messages
+                        print('Журнал iPhone оборвался (так бывает при включении авиарежима), подключаюсь снова…', flush=True)
+                    gave_up = loop.time() - down_since > LOG_RECONNECT_SECONDS
+                if gave_up:
+                    # Over Wi-Fi airplane mode may take the whole connection down: keep what was collected.
+                    if received: break
+                    raise RuntimeError(f'Журнал iPhone недоступен больше {LOG_RECONNECT_SECONDS} с. '
+                                       'Проверьте кабель или Wi-Fi и повторите.') from error
+                await asyncio.sleep(min(1, max(0, deadline - loop.time())))
+    # CommCenter writes thousands of lines a minute: nothing at all means no log, not a quiet phone.
+    require(received, f'Журнал CommCenter не пришёл за {seconds} с. Проверьте кабель или Wi-Fi и повторите.')
+    if down_since is not None:
+        print('Журнал не вернулся' + ('' if loop.time() >= deadline else f' за {LOG_RECONNECT_SECONDS} с') +
+              '. Отчёт собран по тому, что успело прийти.', flush=True)
+    elif reconnects:
+        print(f'Журнал прерывался, переподключений: {reconnects}. Отчёт собран по тому, что успело прийти.', flush=True)
 
 
 def diag_collect(state):
@@ -1580,6 +1658,7 @@ def diag_collect(state):
             if codec:
                 state.setdefault(slot, {})['codec'] = (codec,)
         return sip
+    on_entry.reset = feed_sip.reset
     return on_entry
 
 
@@ -1658,6 +1737,7 @@ async def run_watch_call(device, args, rows):
             print(f'  {e.timestamp:%H:%M:%S} {slot} SIP {first}' + (f'  [{extra}]' if extra else ''), flush=True)
         elif m := DIAG_PATTERNS['call_status'].search(msg):
             print(f'  {e.timestamp:%H:%M:%S} {slot} звонок: {m.group(1)}', flush=True)
+    on_entry.reset = collect.reset
     await commcenter_stream(device, args.seconds, out / 'commcenter.log', on_entry)
     codecs = sorted({CODEC_NAMES.get(v['codec'][0], v['codec'][0]) for v in state.values() if 'codec' in v})
     print('\nСогласованные кодеки: ' + (', '.join(codecs) if codecs else 'звонков с ответом SDP не было'), flush=True)

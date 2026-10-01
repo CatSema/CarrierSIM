@@ -301,6 +301,112 @@ class RetryTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.args.udid, 'phone')
 
 
+class LogStreamTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def entry(text, filename='/System/Library/Frameworks/CoreTelephony.framework/Support/CommCenter'):
+        return SimpleNamespace(message=text, label=None, filename=filename,
+                               timestamp=__import__('datetime').datetime(2026, 9, 30))
+
+    async def collect(self, plan, seconds=0.5, pids=None, on_entry=None):
+        # plan: one item per syslog() call — a list of texts (or (text, filename)), optionally ending in an exception.
+        # pids: one item per get_pid_list() call — True, False (no CommCenter) or an exception to raise.
+        plan = list(plan); pids = list(pids or []); seen = []; self.syslog_pids = []
+
+        test = self
+
+        class FakeTrace:
+            def __init__(self, device): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get_pid_list(self):
+                found = pids.pop(0) if pids else True
+                if isinstance(found, BaseException): raise found
+                return {'Payload': {'42': {'ProcessName': 'CommCenter'}} if found else {}}
+            async def syslog(self, pid):
+                test.syslog_pids.append(pid)
+                step = plan.pop(0) if plan else []
+                for item in step:
+                    if isinstance(item, BaseException): raise item
+                    yield LogStreamTest.entry(*item) if isinstance(item, tuple) else LogStreamTest.entry(item)
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('pymobiledevice3.services.os_trace.OsTraceService', FakeTrace), \
+                patch.object(carrier.asyncio, 'sleep', AsyncMock()), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            await carrier.commcenter_stream(None, seconds, pathlib.Path(directory, 'log'),
+                                            on_entry or (lambda e, msg: seen.append(msg)))
+        return seen, output.getvalue()
+
+    async def test_drop_then_reconnect_counts_one_reconnect(self):
+        from pymobiledevice3.exceptions import ConnectionTerminatedError
+        seen, out = await self.collect([['before', ConnectionTerminatedError()], ['after']])
+        self.assertEqual(seen, ['before', 'after'])
+        self.assertIn('переподключений: 1', out)
+
+    async def test_socket_timeout_is_a_drop_not_the_end(self):
+        seen, out = await self.collect([['before', TimeoutError(60, 'Operation timed out')], ['after']])
+        self.assertEqual(seen, ['before', 'after'])
+
+    async def test_missing_commcenter_on_reconnect_is_retried(self):
+        from pymobiledevice3.exceptions import ConnectionTerminatedError
+        # pids: initial lookup, then "not running yet", then found again.
+        seen, out = await self.collect([['before', ConnectionTerminatedError()], ['after']], pids=[True, False, True])
+        self.assertEqual(seen, ['before', 'after'])
+
+    async def test_process_list_refused_over_wifi_streams_all_and_keeps_commcenter(self):
+        from pymobiledevice3.exceptions import ConnectionTerminatedError
+        seen, out = await self.collect([['before', ('noise', '/usr/libexec/locationd'), ConnectionTerminatedError()],
+                                        ['after']], pids=[ConnectionTerminatedError()])
+        self.assertEqual(seen, ['before', 'after'])
+        # The refused list is not asked for again on reconnect: both streams are unfiltered.
+        self.assertEqual(self.syslog_pids, [carrier.ALL_PROCESSES] * 2)
+        self.assertIn('переподключений: 1', out)
+
+    async def test_refused_lookup_on_reconnect_is_a_drop_not_the_wifi_fallback(self):
+        from pymobiledevice3.exceptions import ConnectionTerminatedError
+        # Cable, airplane mode: the relay is still down when the pid is looked up again.
+        seen, out = await self.collect([['before', ConnectionTerminatedError()], ['after']],
+                                       pids=[True, ConnectionTerminatedError(), True])
+        self.assertEqual(seen, ['before', 'after'])
+        self.assertEqual(self.syslog_pids, [42, 42])
+        self.assertNotIn('список процессов', out)
+
+    async def test_fatal_error_is_not_swallowed(self):
+        from pymobiledevice3.exceptions import NotPairedError
+        with self.assertRaises(NotPairedError):
+            await self.collect([['before', NotPairedError()]])
+
+    async def test_log_that_never_came_is_an_error(self):
+        from pymobiledevice3.exceptions import ConnectionFailedError
+        with patch.object(carrier, 'LOG_RECONNECT_SECONDS', 0.05), self.assertRaisesRegex(RuntimeError, 'недоступен'):
+            await self.collect([[ConnectionFailedError()]] * 10000, seconds=5)
+
+    async def test_log_that_never_returns_keeps_what_was_collected(self):
+        from pymobiledevice3.exceptions import ConnectionFailedError
+        with patch.object(carrier, 'LOG_RECONNECT_SECONDS', 0.05):
+            seen, output = await self.collect([['before', ConnectionFailedError()]] + [[ConnectionFailedError()]] * 10000,
+                                              seconds=5)
+        self.assertEqual(seen, ['before'])
+        self.assertIn('Журнал не вернулся за 0.05 с', output)
+
+    async def test_hung_reconnect_is_bounded_and_keeps_what_was_collected(self):
+        from pymobiledevice3.exceptions import ConnectionFailedError
+        with patch.object(carrier, 'LOG_RECONNECT_SECONDS', 0.05):
+            seen, output = await self.collect([['before', ConnectionFailedError()], []], seconds=30)
+        self.assertEqual(seen, ['before'])
+        self.assertIn('Журнал не вернулся за 0.05 с', output)
+
+    async def test_silent_log_is_an_error_not_an_empty_report(self):
+        with self.assertRaisesRegex(RuntimeError, 'не пришёл'):
+            await self.collect([[]], seconds=0.1)
+
+    async def test_local_write_failure_is_not_a_drop(self):
+        def broken(e, msg): raise OSError(28, 'No space left on device')
+        with self.assertRaises(OSError):
+            await self.collect([['before']], on_entry=broken)
+
+
 class ErrorTextTest(unittest.IsolatedAsyncioTestCase):
     def test_empty_exceptions_get_readable_text(self):
         from pymobiledevice3.exceptions import ConnectionTerminatedError, ConnectionFailedError
