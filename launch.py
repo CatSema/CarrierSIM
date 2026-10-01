@@ -120,7 +120,7 @@ def python_environment():
 def menu(wifi=False):
     print('\n' + '─' * 56)
     print(f'  CarrierSIM {VERSION}  ·  Vodafone HU')
-    print('  Один профиль для всех SIM · привязка по IMSI')
+    print('  Профиль для SIM России и Беларуси · привязка по IMSI')
     print('  Исследование, разработка и тесты — Vladimir B / vlw')
     print('  vlwwwwww@gmail.com')
     print('─' * 56)
@@ -167,7 +167,7 @@ def choose_sims(question):
     print(f'\n  {question}\n'
           '  1  SIM 1\n'
           '  2  SIM 2\n'
-          '  Enter — обе (все найденные)')
+          '  Enter — обе (зарубежную SIM не трогает — выберите её номер)')
     while True:
         sims = input('  SIM: ').strip()
         if sims in ('', '1', '2'): return sims or 'all'
