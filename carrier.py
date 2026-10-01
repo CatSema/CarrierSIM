@@ -529,6 +529,41 @@ def device_log(device, path):
     return syslog_capture(device, path, lambda line: any(k in line.lower() for k in DEVICE_LOG_KEYS))
 
 
+# atc on the phone logs this when it rejects the computer's Apple components. Seen on Windows with
+# some iTunes installs, fixed by reinstalling iTunes; another attempt with the same components fails alike.
+GRAPPA_REFUSED = 'Grappa session could not be established'
+
+
+def grappa_refused(log):
+    with contextlib.suppress(OSError):
+        return GRAPPA_REFUSED in log.read_text(encoding='utf-8', errors='replace')
+    return False
+
+
+class GrappaRefused(RuntimeError):
+    pass
+
+
+def grappa_hint(cause=''):
+    text = ('iPhone не принял компоненты Apple на этом компьютере (в журнале iPhone: «' + GRAPPA_REFUSED + '»), '
+            'повтор не поможет.')
+    if sys.platform == 'win32':
+        text += (' Переустановите iTunes: удалите его (и версию из Microsoft Store, если есть), установите iTunes x64 '
+                 'с сайта Apple (https://support.apple.com/en-us/106372), запустите один раз и повторите. '
+                 'Подробнее — README, раздел «Grappa session could not be established».')
+    else:
+        text += ' Скопируйте блок отладки выше в issue на GitHub.'
+    # The host's own error stays in the message: journals and the debug block keep the real failure.
+    return text + (f' Ошибка хоста: {cause}' if cause else '')
+
+
+def grappa_failure(error, log):
+    # Only the host's own failure: an AFC or Books error inside the pause keeps its cause and retries.
+    if isinstance(error, RuntimeError) and 'Сбой AirTraffic' in str(error) and grappa_refused(log):
+        return GrappaRefused(grappa_hint(str(error)))
+    return None
+
+
 async def transfer(device, run, payload=None, expected=None, recovery=False):
     from pymobiledevice3.services.afc import AfcService
     run.mkdir(parents=True, exist_ok=False)
@@ -611,8 +646,12 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
                 require(await remote_tree(afc, exported) == snapshot, 'Export changed after backup')
                 phase('final-authorized')
             phase('host-started')
-            async with device_log(device, run / 'device.log'):
-                await host_session(device.udid, assets, pause, run)
+            try:
+                async with device_log(device, run / 'device.log'):
+                    await host_session(device.udid, assets, pause, run)
+            except Exception as error:
+                if (refused := grappa_failure(error, run / 'device.log')): raise refused from error
+                raise
             # The phone may take several seconds to move the final asset after the session ends.
             for _ in range(150):
                 if await exists(afc, final_source) is None:
@@ -1359,6 +1398,7 @@ def transient_error(error):
     if isinstance(error,OSError) and error.errno in (32,54,60,104,110,50,51,64,65,
                                                      10050,10051,10054,10060,10064,10065):return True
     # The phone answering without our assets is deterministic: retrying only repeats it.
+    if isinstance(error,GrappaRefused):return False
     return isinstance(error,RuntimeError) and any(t in str(error) for t in
         ('Сбой AirTraffic','Final source not consumed')) and 'не подтвердил нужные объекты' not in str(error)
 

@@ -659,6 +659,43 @@ class OutcomeTest(unittest.TestCase):
         self.assertIn('подпись не принята', carrier.slot_outcome(r('Vodafone_tr.bundle', False), False))
 
 
+class GrappaTest(unittest.TestCase):
+    LINE = ('Sep 30 23:58:12 iPhone atc(AirTrafficDevice)[56] <Error>: '
+            'Grappa session could not be established. Aborting\n')
+
+    def test_refusal_is_found_in_the_device_log_only_when_logged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = pathlib.Path(temp) / 'device.log'
+            self.assertFalse(carrier.grappa_refused(log))
+            log.write_text('atc(AirTrafficDevice)[56] <Notice>: SyncAllowed\n', encoding='utf-8')
+            self.assertFalse(carrier.grappa_refused(log))
+            log.write_text(self.LINE, encoding='utf-8')
+            self.assertTrue(carrier.grappa_refused(log))
+
+    def test_hint_is_not_retried_and_names_the_fix_on_windows(self):
+        for platform, fix in (('win32', 'support.apple.com/en-us/106372'), ('darwin', 'блок отладки выше')):
+            with self.subTest(platform=platform), patch.object(carrier.sys, 'platform', platform):
+                hint = carrier.grappa_hint()
+                self.assertIn(fix, hint)
+                self.assertIn(carrier.GRAPPA_REFUSED, hint)
+                self.assertFalse(carrier.transient_error(RuntimeError(hint)))
+
+    def test_only_the_host_failure_becomes_a_refusal(self):
+        cause = 'Сбой AirTraffic: Синхронизация закончилась преждевременно'
+        with tempfile.TemporaryDirectory() as temp:
+            log = pathlib.Path(temp) / 'device.log'
+            log.write_text(self.LINE, encoding='utf-8')
+            refused = carrier.grappa_failure(RuntimeError(cause), log)
+            self.assertIsInstance(refused, carrier.GrappaRefused)
+            self.assertIn(cause, str(refused))
+            self.assertFalse(carrier.transient_error(refused))
+            # A dropped AFC link during the pause stays itself and is retried.
+            self.assertIsNone(carrier.grappa_failure(ConnectionResetError(54, 'reset'), log))
+            self.assertIsNone(carrier.grappa_failure(RuntimeError('Книги изменились'), log))
+            log.write_text('atc <Notice>: SyncFailed\n', encoding='utf-8')
+            self.assertIsNone(carrier.grappa_failure(RuntimeError(cause), log))
+
+
 class LocalNetworkTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         patcher = patch.object(carrier, 'LOCAL_NETWORK_WAIT', 0)
