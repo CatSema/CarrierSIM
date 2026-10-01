@@ -13,8 +13,11 @@ import tempfile
 import zipfile
 from carriersim_version import VERSION
 
-ROOT = Path(__file__).resolve().parent
+# In a PyInstaller build the executable is both the launcher and carrier.py (called with --carrier).
+FROZEN = getattr(sys, 'frozen', False)
+ROOT = Path(sys.executable if FROZEN else __file__).resolve().parent
 UNCONFIRMED = 3  # carrier.py: written, but iOS did not confirm the chosen bundle
+NOTHING_TO_WRITE = 4  # carrier.py --status with CARRIERSIM_PLAN=1: the plan writes nothing
 
 
 def run_carrier(python, args, **kwargs):
@@ -24,7 +27,8 @@ def run_carrier(python, args, **kwargs):
     # handler, not SIG_IGN: an ignored SIGINT would be inherited and carrier.py could not be stopped.
     previous = signal.signal(signal.SIGINT, lambda *_: None)
     try:
-        return subprocess.run([str(python), '-u', str(ROOT / 'carrier.py'), *args], cwd=ROOT, **kwargs).returncode
+        command = [str(python), '--carrier'] if FROZEN else [str(python), '-u', str(ROOT / 'carrier.py')]
+        return subprocess.run([*command, *args], cwd=ROOT, **kwargs).returncode
     finally:
         signal.signal(signal.SIGINT, previous)
 
@@ -73,6 +77,7 @@ def install_dependencies(python, version):
 
 
 def python_environment():
+    if FROZEN: return Path(sys.executable)
     if sys.version_info < (3, 11):
         raise RuntimeError('Нужен Python 3.11 или новее: https://www.python.org/downloads/')
     if sys.platform == 'win32' and sys.maxsize <= 2**32:
@@ -120,7 +125,7 @@ def python_environment():
 def menu(wifi=False):
     print('\n' + '─' * 56)
     print(f'  CarrierSIM {VERSION}  ·  Vodafone HU')
-    print('  Один профиль для всех SIM · привязка по IMSI')
+    print('  Профиль для SIM России и Беларуси · привязка по IMSI')
     print('  Исследование, разработка и тесты — Vladimir B / vlw')
     print('  vlwwwwww@gmail.com')
     print('─' * 56)
@@ -160,14 +165,23 @@ def other_profile():
         if not name: return False
         if re.fullmatch(r'[A-Za-z0-9_]+', name): break
         print('  Только латинские буквы, цифры и _. Например: O2_Germany.')
-    return ['--bundle', name, '--sims', choose_sims('На какие SIM установить?')]
+    # A tuple asks main() to show the plan and the bundle passport first and write only after a yes.
+    return ('confirm', ['--bundle', name, '--sims', choose_sims('На какие SIM установить?')])
+
+
+def ask_yes(question):
+    while True:
+        answer = input(question).strip().lower()
+        if answer in ('', 'д', 'да', 'y', 'yes'): return True
+        if answer in ('н', 'нет', 'n', 'no'): return False
+        print('  Введите «д» или «н».')
 
 
 def choose_sims(question):
     print(f'\n  {question}\n'
           '  1  SIM 1\n'
           '  2  SIM 2\n'
-          '  Enter — обе (все найденные)')
+          '  Enter — обе (зарубежную SIM не трогает — выберите её номер)')
     while True:
         sims = input('  SIM: ').strip()
         if sims in ('', '1', '2'): return sims or 'all'
@@ -175,6 +189,10 @@ def choose_sims(question):
 
 
 def main():
+    if FROZEN and sys.argv[1:2] == ['--carrier']:
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
+        import carrier
+        return carrier.cli()
     os.chdir(ROOT)
     check_writable()
     python = None
@@ -186,6 +204,8 @@ def main():
         args = menu(wifi)
         if args is None: return 0
         if args is False: continue
+        confirm = isinstance(args, tuple)
+        if confirm: args = args[1]
         if args == 'wifi':
             wifi = not wifi
             if wifi:
@@ -198,7 +218,14 @@ def main():
         print('\n' + '─' * 56, flush=True)
         try:
             if python is None: python = python_environment()
-            code = run_carrier(python, args, env={**os.environ, 'CARRIERSIM_MENU': '1'})
+            env = {**os.environ, 'CARRIERSIM_MENU': '1'}
+            code = run_carrier(python, [*args, '--status'], env={**env, 'CARRIERSIM_PLAN': '1'}) if confirm else 0
+            if code == NOTHING_TO_WRITE:
+                print('\n  Записывать нечего, установка не запущена. Причина указана выше.'); code = 0
+            elif confirm and not code and not ask_yes('\n  Записать этот профиль? Enter или «д» — да, «н» — нет: '):
+                print('Установка не запущена.')
+            elif not code:
+                code = run_carrier(python, args, env=env)
             if code == UNCONFIRMED:
                 print('\nВыбор профиля не подтверждён. Подробности — в журнале операции.')
             elif code:

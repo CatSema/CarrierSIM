@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import hashlib
 import io
 import json
@@ -19,7 +20,10 @@ import time
 import zipfile
 from carriersim_version import VERSION
 
-ROOT = Path(__file__).resolve().parent
+# A PyInstaller build (CarrierSIM executable) keeps bundle.yaml, assets.zip and runs next to itself.
+FROZEN = getattr(sys, 'frozen', False)
+SELF = Path(sys.executable if FROZEN else __file__).resolve()
+ROOT = SELF.parent
 
 PARENT = '/var/mobile/Library/Carrier Bundles'
 TARGET = PARENT + '/iPhone'
@@ -899,7 +903,7 @@ def native_host(udid, assets, directories):
 
 
 def host_command():
-    return [sys.executable, str(Path(__file__).resolve()), '--_host']
+    return [sys.executable, '--carrier', '--_host'] if FROZEN else [sys.executable, str(SELF), '--_host']
 
 
 async def host_session(udid, assets, callback, run):
@@ -967,6 +971,8 @@ def bundle_link(name):
 SLOT_NAMES = {'kOne': 'SIM 1', 'kTwo': 'SIM 2'}
 # Exit code for "written, but iOS did not confirm the chosen bundle"; 2 is argparse's usage error.
 UNCONFIRMED = 3
+# Exit code of --status for the menu's plan-then-confirm (CARRIERSIM_PLAN=1): nothing would be written.
+NOTHING_TO_WRITE = 4
 SLOT_CHOICES = {'1': ('kOne',), '2': ('kTwo',), 'all': ('kOne', 'kTwo')}
 
 
@@ -990,8 +996,101 @@ def load_bundle_config(path=CONFIG):
     return config
 
 
-def bundle_for(plmn, config):
-    return config.get(plmn) or config.get('default') or BUNDLE
+# "default" covers only the operators this tool is for; a foreign SIM keeps its own profile
+# unless bundle.yaml names its MCCMNC or the user picked its slot explicitly.
+HOME_MCC = ('250', '257')
+
+
+def bundle_for(plmn, config, any_mcc=False):
+    if config.get(plmn): return config[plmn]
+    if any_mcc or plmn[:3] in HOME_MCC: return config.get('default') or BUNDLE
+    return None
+
+
+# Bundle properties extracted from an IPSW by ios-bundles.github.io; file contents, not device tests.
+CATALOG_URL = 'https://ios-bundles.github.io/data.json'
+CATALOG_MAX_AGE = 7 * 24 * 3600
+
+
+def parse_catalog(data):
+    # JSON syntax alone is not enough: these values become dictionaries and lookup keys
+    # when printing the passport. Validate downloads before replacing a working cache.
+    catalog = json.loads(data)
+    require(isinstance(catalog, dict), 'Invalid catalog object')
+    meta, rows = catalog.get('meta', {}), catalog.get('bundles')
+    require(isinstance(meta, dict) and isinstance(rows, list), 'Invalid catalog structure')
+    bundles = {}
+    for row in rows:
+        require(isinstance(row, dict), 'Invalid catalog bundle')
+        name = row.get('b')
+        require(isinstance(name, str) and bool(name), 'Invalid catalog bundle name')
+        require(row.get('ih') is None or isinstance(row['ih'], str), 'Invalid catalog Wi-Fi preference')
+        bundles[name] = row
+    return {'meta': meta, 'bundles': bundles}
+
+
+@functools.lru_cache(maxsize=None)
+def load_catalog(runs):
+    # A fresh cache, else the site, else a stale cache; None when nothing is available. Never fatal.
+    cache = Path(runs) / 'bundles.json'
+    try:
+        fresh = cache.exists() and time.time() - cache.stat().st_mtime < CATALOG_MAX_AGE
+        if not fresh:
+            import ssl, urllib.request
+            try:
+                import certifi
+                context = ssl.create_default_context(cafile=certifi.where())
+            except ImportError:
+                context = ssl.create_default_context()
+            with urllib.request.urlopen(CATALOG_URL, timeout=5, context=context) as response:
+                data = response.read(8 << 20)
+            parse_catalog(data)
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            # Atomic: a torn file with a fresh mtime would pass as a valid cache for a week.
+            tmp = cache.with_suffix('.tmp'); tmp.write_bytes(data); tmp.replace(cache)
+    except Exception:
+        pass
+    try:
+        return parse_catalog(cache.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+
+
+def catalog_name_error(name, catalog):
+    # Bundle names are case-sensitive on the phone; a case-only mismatch would cost a whole install cycle.
+    name = name.removesuffix('.bundle')
+    if not catalog or name in catalog['bundles']: return None
+    same = [b for b in catalog['bundles'] if b.lower() == name.lower()]
+    return same and f'Пакета {name} нет, но есть {same[0]}: регистр букв важен. Укажите {same[0]}.'
+
+
+def passport_lines(name, catalog):
+    name = name.removesuffix('.bundle')
+    if not catalog: return []
+    meta = catalog['meta']; r = catalog['bundles'].get(name)
+    where = f"iOS {meta.get('ios', '?')}, {meta.get('deviceName', '?')}"
+    if r is None:
+        import difflib
+        near = difflib.get_close_matches(name, catalog['bundles'], 3, 0.6)
+        return [f'  {name}: нет в таблице пакетов ({where}); в вашей iOS пакет может быть или не быть.'
+                + (' Похожие: ' + ', '.join(near) + '.' if near else '')]
+    yn = lambda v, unset='не задано': 'да' if v is True else 'нет' if v is False else unset
+    pref = lambda v: {'wifi': 'Wi-Fi', 'ims': 'Wi-Fi', 'cellular': 'сотовая'}.get(v, 'не задан')
+    reg = str(r.get('reg') or '')
+    # International: an exit prefix (+, 00, 011) and a full number; anything else is local to the bundle's country.
+    imessage = ('международный номер' if re.fullmatch(r'(?:\+|00|011)\d{7,}', reg) else
+                f'местный номер {reg} другой страны: из российской сети недоступен, повторная активация '
+                'по номеру может не пройти' if reg else 'номер не задан')
+    lines = [f"  {name} ({r.get('country') or '?'}) — по файлу пакета, {where}, не проверка на телефоне:",
+             f"    VoWiFi: приоритет дома — {pref(r.get('ih'))}, в роуминге — {yn(r.get('wroam'))}"
+             + (f", подпись «{r['wn']}»" if r.get('wn') else ''),
+             f"    iMessage/FaceTime: {imessage}",
+             f"    значок {r.get('lte') or 'LTE'} · переключатель VoLTE {'нет' if r.get('vs') is False else 'есть'}"
+             f" · 5G {'скрыт' if r.get('sw5g') is False else 'есть'} · EVS {'есть' if r.get('evs') else 'нет'}"
+             f" · доп. услуги по IMS (XCAP) {yn(r.get('xcap'))}"]
+    if r.get('vvm') and r.get('vvm') != 'none':
+        lines.append(f"    визуальная голосовая почта: служебные SMS уходят на номер {r.get('beacon') or 'чужого оператора'}")
+    return lines
 
 
 OPERATORS = {'232-05': 'One', '250-01': 'МТС', '250-02': 'МегаФон', '250-11': 'Yota', '250-20': 'T2',
@@ -1026,7 +1125,8 @@ def sim_line(row, top):
                          f'ICCID …{iccid[-4:]}' if len(iccid) >= 4 else 'ICCID недоступен', phone, 'сейчас: ' + current))
 
 
-def select_sims(rows, config=None, slots=SLOT_CHOICES['all']):
+def select_sims(rows, config=None, slots=SLOT_CHOICES['all'], any_mcc=True, skipped=None, only_skipped_ok=False):
+    # any_mcc=False leaves foreign SIMs without their own bundle.yaml line out; their slots go to skipped.
     selected = []; seen_slots = set(); seen_imsi = set()
     for row in rows:
         mcc, mnc = str(row.get('MCC','')), str(row.get('MNC',''))
@@ -1034,14 +1134,27 @@ def select_sims(rows, config=None, slots=SLOT_CHOICES['all']):
         require(slot in ('kOne','kTwo') and slot not in seen_slots, 'Неоднозначные слоты SIM; запись отменена.')
         seen_slots.add(slot)
         if slot not in slots: continue
+        # An empty MCC (locked phone, line off) must not pass for a foreign SIM.
+        require(re.fullmatch(r'\d{3}',mcc) and re.fullmatch(r'\d{2,3}',mnc),
+                'iPhone не сообщил оператора SIM '+(mcc+mnc or SLOT_NAMES.get(slot,str(slot)))+
+                '. Включите линию и разблокируйте телефон.')
+        bundle = bundle_for(mcc+mnc, config or {}, any_mcc)
+        if bundle is None:
+            if skipped is not None: skipped.append(slot)
+            continue
         require(re.fullmatch(r'\d{3}',mcc) and re.fullmatch(r'\d{2,3}',mnc) and isinstance(imsi,str) and
                 re.fullmatch(r'\d{15}',imsi) and imsi.startswith(mcc+mnc),
                 'iPhone не сообщил полный IMSI для SIM '+mcc+mnc+'. Включите линию и разблокируйте телефон.')
         require(imsi not in seen_imsi, 'Один IMSI указан в двух слотах; запись отменена.')
         seen_imsi.add(imsi)
-        selected.append({'slot':slot,'plmn':mcc+mnc,'imsi':imsi,'bundle':bundle_for(mcc+mnc, config or {})})
+        selected.append({'slot':slot,'plmn':mcc+mnc,'imsi':imsi,'bundle':bundle})
     missing = [SLOT_NAMES[s] for s in slots if s not in seen_slots]
     require(len(slots) > 1 or not missing, missing and missing[0]+' не найдена в iPhone. Выберите другую SIM.')
+    # --status only reads: a phone with foreign SIMs alone still shows its plan ("не трогаю").
+    if not selected and skipped and only_skipped_ok: return selected
+    require(selected or skipped is None or not skipped,
+            'Нет SIM операторов России или Беларуси. Чтобы сменить профиль зарубежной SIM, добавьте её MCCMNC '
+            'в bundle.yaml или выберите эту SIM в пункте 7 (флаг --sims 1 или 2).')
     require(selected, 'Телефон не сообщил ни одной SIM с доступным IMSI.')
     return selected
 
@@ -1214,6 +1327,16 @@ def report_log(path, sims):
                     results[slot].update(selected=resolved[0].strip().rsplit('/',1)[-1],
                                          verified=verified==['Success'])
     return list(results.values())
+
+
+def slot_outcome(result, ok):
+    # One line per SIM after the rescan; the wording is what users paste into bug reports.
+    expected = (result['expected'] or '').removesuffix('.bundle')
+    selected = (result['selected'] or '').removesuffix('.bundle')
+    if ok: return (selected or 'штатный профиль') + ' — подпись принята'
+    if not selected: return 'в журнале пересканирования нет выбора пакета для этой SIM'
+    if expected and selected.lower() != expected.lower(): return f'iOS выбрала {selected} вместо {expected}'
+    return f'{selected} выбран, но подпись не принята'
 
 
 def read_json(path):
@@ -1567,7 +1690,10 @@ async def execute(args,assets):
         rows=await device.get_value(key='CarrierBundleInfoArray') or []
         top=await device.get_value() or {}
         slots=SLOT_CHOICES[args.sims]
-        sims=select_sims(rows,args.bundles,slots) if not (args.restore or args.restore_backup or args.recover) else []
+        # A slot picked by number is the user's explicit choice; "all" leaves foreign SIMs alone.
+        any_mcc=args.sims!='all'; skipped=[]
+        sims=(select_sims(rows,args.bundles,slots,any_mcc,skipped,only_skipped_ok=args.status)
+              if not (args.restore or args.restore_backup or args.recover) else [])
         restore_imsis=None
         if args.restore:
             sims=[{'slot':r['Slot'],'plmn':str(r.get('MCC',''))+str(r.get('MNC','')),'bundle':None}
@@ -1580,10 +1706,28 @@ async def execute(args,assets):
         for s in sims:
             target='штатный профиль' if args.restore else s['bundle'].removesuffix('.bundle')+' (по IMSI)'
             print(f"  {sim_line(row_by_slot[s['slot']],top)}  →  план: {target}",flush=True)
+        for slot in skipped:
+            print(f"  {sim_line(row_by_slot[slot],top)}  →  план: не трогаю (зарубежная SIM: добавьте её MCCMNC "
+                  "в bundle.yaml или выберите эту SIM в пункте 7)",flush=True)
         print(flush=True)
+        bundles=sorted({s['bundle'] for s in sims if s['bundle']})
+        if bundles:
+            # Blocking I/O off the event loop; cached per process, so retries do not wait again.
+            catalog=await asyncio.to_thread(load_catalog,args.runs)
+            for name in bundles:
+                error=catalog_name_error(name,catalog);require(not error,error)
+                for line in passport_lines(name,catalog): print(line,flush=True)
+            if catalog: print(flush=True)
         if args.status:
             print('Сверьте последние 4 цифры ICCID: Настройки → Основные → Об этом устройстве → ICCID нужной линии. '
                   '«сейчас» — профиль, загруженный iPhone; «план» — что будет записано.',flush=True)
+            blocked=pending(args.runs,udid)
+            if blocked:
+                # Menu 7 confirms after this plan: say now that the write will not start, not after "да".
+                print('Внимание: прошлая операция на этом iPhone не завершилась, запись не начнётся. Сначала '
+                      +recover_hint()+'.',flush=True)
+            # The menu must not ask "write?" when the write would not start or has nothing to write.
+            if os.environ.get('CARRIERSIM_PLAN') and (blocked or not sims): return NOTHING_TO_WRITE
             return
         custom=None
         if args.trigger:
@@ -1670,7 +1814,7 @@ async def execute(args,assets):
             print('[2/4] Сохраняю исходные настройки…',flush=True)
             original=await transfer(device,run/'snapshot')
             require(original is not None,'Не удалось сохранить исходный каталог.')
-            current=select_sims(await device.get_value(key='CarrierBundleInfoArray') or [],args.bundles,slots)
+            current=select_sims(await device.get_value(key='CarrierBundleInfoArray') or [],args.bundles,slots,any_mcc)
             require(current==sims,'SIM изменились во время операции; запись отменена.')
             desired=make_plan(original,sims)
             save_json(run/'plan.json',{'slots':[{k:v for k,v in s.items() if k!='imsi'} for s in sims],
@@ -1690,8 +1834,7 @@ async def execute(args,assets):
         unconfirmed=False
         for s in result:
             ok=s['verified'] and (args.restore or (s['selected'] or '').lower()==s['expected'].lower());unconfirmed |= not ok
-            print(f"{SLOT_NAMES[s['slot']]} ({s['plmn']}): "+(s['selected']+' — подпись принята' if ok else
-                  'выбор нужного пакета не подтверждён; см. журнал'),flush=True)
+            print(f"{SLOT_NAMES[s['slot']]} ({s['plmn']}): "+slot_outcome(s,ok),flush=True)
         if args.restore:
             print(('Ссылка по IMSI выбранной SIM удалена, другая SIM не тронута.' if restore_imsis else
                    'Все ссылки по IMSI удалены.')+' Обычные ссылки операторов сохранены.',flush=True)
@@ -1709,8 +1852,8 @@ async def execute(args,assets):
         if missing:
             # AFC cannot read /System, so a missing bundle only shows up in the rescan log.
             # Never leave links to it: put back the catalog saved before this write.
-            print('iOS не выбрала '+', '.join(missing)+': такого пакета, видимо, нет в этой '
-                  'версии iOS или имя введено с ошибкой. Возвращаю прежние настройки…',flush=True)
+            print('iOS не выбрала '+', '.join(missing)+': пакета может не быть в этой версии iOS, имя может '
+                  'быть с ошибкой, или iOS отдаёт этой SIM другой пакет. Возвращаю прежние настройки…',flush=True)
             # The rescan trigger may have touched other parts of the catalog since the readback;
             # only this run's IMSI links must still be exactly as written.
             await transfer(device,run/'rollback',payload=original,
@@ -1723,7 +1866,13 @@ async def execute(args,assets):
                                          'rolled_back':True})
             print('Прежние настройки возвращены. Проверьте имя пакета (bundle.yaml или пункт 7) и повторите.',flush=True)
             return UNCONFIRMED
-        if unconfirmed:return UNCONFIRMED
+        if unconfirmed:
+            print(('Каталог записан, но журнал не подтвердил выбор. Включите авиарежим на 15 секунд и откройте '
+                   'пункт 2 (--status): в строке «сейчас» должен быть нужный профиль. Если там прежний, '
+                   'верните штатный пунктом 4 и пришлите автору журнал операции.') if installing else
+                  ('Журнал не подтвердил выбор штатного профиля. Включите авиарежим на 15 секунд и откройте '
+                   'пункт 2 (--status): в строке «сейчас» должен быть профиль оператора.'),flush=True)
+            return UNCONFIRMED
         print('Books: служебные файлы синхронизации возвращены в исходное состояние'+books_summary(run)+'.',flush=True)
         print('Готово. Включите авиарежим на 15 секунд и проверьте связь. Работа 5G не проверялась.')
         return 0
@@ -1767,7 +1916,7 @@ def environment_info():
     import platform
     from importlib.metadata import version, metadata, PackageNotFoundError
     rows = [('CarrierSIM', VERSION),
-            ('Сборка скрипта', digest((ROOT/'carrier.py').read_bytes())[:12]),
+            ('Сборка скрипта', digest(SELF.read_bytes())[:12]),
             ('Python', f"{sys.version.split()[0]} {platform.machine()} {'64' if sys.maxsize > 2**32 else '32'}-bit")]
     libs = []
     for name in ('pymobiledevice3', 'cryptography', 'pyimg4', 'pylzss', 'lzfse'):
@@ -1929,7 +2078,7 @@ class Tee:
 def start_session_log(runs):
     path = runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'session.log')
     log = path.open('a', encoding='utf-8', buffering=1)
-    log.write(f'CarrierSIM {VERSION} · сборка {digest((ROOT/"carrier.py").read_bytes())[:12]}\n')
+    log.write(f'CarrierSIM {VERSION} · сборка {digest(SELF.read_bytes())[:12]}\n')
     log.write(' '.join(['carrier.py'] + sys.argv[1:]) + '\n')
     sys.stdout, sys.stderr = Tee(sys.stdout, log), Tee(sys.stderr, log)
     DIAG['session_log'] = str(path)
@@ -1984,7 +2133,7 @@ def main():
             native_host(value.get('udid'),value.get('assets',[]),value.get('directories',[]))
             return 0
         except Exception as e:framed({'ok':False,'error':error_text(e)});return 1
-    parser=argparse.ArgumentParser(description='Vodafone_hu для всех SIM независимо от страны. '
+    parser=argparse.ArgumentParser(description='Профиль из bundle.yaml для SIM России и Беларуси; зарубежные — только по явному выбору. '
         'Без флагов: установить по IMSI на SIM, сообщённые iPhone. Без ограничений по модели iPhone и версии iOS; совместимость не гарантируется.',
         add_help=False)
     parser.add_argument('--version', action='version', version=f'CarrierSIM {VERSION}')
@@ -2000,7 +2149,8 @@ def main():
     parser.add_argument('--bundle',metavar='ПАКЕТ',
                         help='один системный пакет для всех выбранных SIM вместо bundle.yaml, например O2_Germany')
     parser.add_argument('--sims',choices=SLOT_CHOICES,default='all',
-                        help='какие SIM менять (установка и --restore): 1, 2 или all — все найденные (по умолчанию)')
+                        help='какие SIM менять (установка и --restore): 1, 2 или all — все найденные (по умолчанию; '
+                             'при установке all пропускает зарубежные SIM без своей строки в bundle.yaml)')
     parser.add_argument('--trigger',type=Path,metavar='IPCC',help='свой подписанный IPCC вместо комплектного; плата и SIM проверяются')
     parser.add_argument('--attempts',type=int,default=3,metavar='N',help='попытки при временном сбое связи (по умолчанию 3)')
     parser.add_argument('--seconds',type=int,metavar='СЕК',help='длительность --diagnose (по умолчанию 90) или --watch-call (по умолчанию 180)')
@@ -2047,6 +2197,9 @@ def main():
     require(check.returncode==0 and frames and frames[-1].get('ok'),
             'Библиотеки Apple недоступны: '+str(frames[-1].get('error') if frames else check.stderr.strip()))
     if args.check:
+        # Every pymobiledevice3 module the phone steps use; a broken install or build fails here, not mid-run.
+        import pymobiledevice3.lockdown, pymobiledevice3.usbmux, pymobiledevice3.services.afc, \
+            pymobiledevice3.services.installation_proxy, pymobiledevice3.services.os_trace, pymobiledevice3.services.syslog
         for k,v in environment_info():print(f'{k}: {v}')
         print('Триггеры целы, библиотеки Apple доступны; пакеты будут взяты из системы iPhone. Подключений к телефону не было.');return 0
     args.runs=args.runs.resolve()
@@ -2062,7 +2215,7 @@ def main():
     with operation_lock(args.runs):return asyncio.run(execute_with_retry(args,assets)) or 0
 
 
-if __name__=='__main__':
+def cli():
     try:sys.exit(main())
     except KeyboardInterrupt:
         print('Прервано. Не удаляйте папку runs. Если запись уже началась, '+recover_hint()+'.',file=sys.stderr);sys.exit(130)
@@ -2070,3 +2223,7 @@ if __name__=='__main__':
         if not (len(sys.argv)>1 and sys.argv[1]=='--_host'):
             with contextlib.suppress(Exception):print_diagnostics(e)
         print('Ошибка:',error_text(e),file=sys.stderr);sys.exit(1)
+
+
+if __name__=='__main__':
+    cli()
