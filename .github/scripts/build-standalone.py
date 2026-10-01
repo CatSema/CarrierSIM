@@ -13,7 +13,7 @@ import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 # Next to the executable, not inside it: the user edits bundle.yaml, carrier.py verifies assets.zip.
-SIDE_FILES = ('README.txt', 'README.md', 'bundle.yaml', 'assets.zip', 'LICENSE-AirLift.txt')
+SIDE_FILES = ('LICENSE', 'README.txt', 'README.md', 'bundle.yaml', 'assets.zip', 'LICENSE-AirLift.txt')
 
 
 def target():
