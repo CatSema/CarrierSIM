@@ -973,6 +973,23 @@ CATALOG_URL = 'https://ios-bundles.github.io/data.json'
 CATALOG_MAX_AGE = 7 * 24 * 3600
 
 
+def parse_catalog(data):
+    # JSON syntax alone is not enough: these values become dictionaries and lookup keys
+    # when printing the passport. Validate downloads before replacing a working cache.
+    catalog = json.loads(data)
+    require(isinstance(catalog, dict), 'Invalid catalog object')
+    meta, rows = catalog.get('meta', {}), catalog.get('bundles')
+    require(isinstance(meta, dict) and isinstance(rows, list), 'Invalid catalog structure')
+    bundles = {}
+    for row in rows:
+        require(isinstance(row, dict), 'Invalid catalog bundle')
+        name = row.get('b')
+        require(isinstance(name, str) and bool(name), 'Invalid catalog bundle name')
+        require(row.get('ih') is None or isinstance(row['ih'], str), 'Invalid catalog Wi-Fi preference')
+        bundles[name] = row
+    return {'meta': meta, 'bundles': bundles}
+
+
 @functools.lru_cache(maxsize=None)
 def load_catalog(runs):
     # A fresh cache, else the site, else a stale cache; None when nothing is available. Never fatal.
@@ -988,15 +1005,14 @@ def load_catalog(runs):
                 context = ssl.create_default_context()
             with urllib.request.urlopen(CATALOG_URL, timeout=5, context=context) as response:
                 data = response.read(8 << 20)
-            json.loads(data)['bundles']
+            parse_catalog(data)
             cache.parent.mkdir(parents=True, exist_ok=True)
             # Atomic: a torn file with a fresh mtime would pass as a valid cache for a week.
             tmp = cache.with_suffix('.tmp'); tmp.write_bytes(data); tmp.replace(cache)
     except Exception:
         pass
     try:
-        catalog = json.loads(cache.read_text(encoding='utf-8'))
-        return {'meta': catalog.get('meta', {}), 'bundles': {r['b']: r for r in catalog['bundles']}}
+        return parse_catalog(cache.read_text(encoding='utf-8'))
     except Exception:
         return None
 

@@ -342,6 +342,54 @@ class CatalogTest(unittest.TestCase):
             self.assertIsNotNone(carrier.load_catalog(runs))
             self.assertEqual([p.name for p in pathlib.Path(runs).iterdir()], ['bundles.json'])
 
+    INVALID_CATALOGS = (
+        None, [], {'meta': None, 'bundles': [{'b': 'Vodafone_tr'}]},
+        {'meta': [], 'bundles': []}, {'bundles': None}, {'bundles': {}},
+        {'bundles': [None]}, {'bundles': [{'b': 123}]}, {'bundles': [{'b': True}]},
+        {'bundles': [{'b': None}]}, {'bundles': [{'b': ''}]}, {'bundles': [{}]},
+        {'bundles': [{'b': 'Vodafone_tr', 'ih': []}]},
+        {'bundles': [{'b': 'Vodafone_tr', 'ih': {}}]},
+    )
+
+    def test_wrong_json_types_skip_passport_without_creating_cache(self):
+        for catalog in self.INVALID_CATALOGS:
+            with self.subTest(catalog=catalog), tempfile.TemporaryDirectory() as runs:
+                response = unittest.mock.MagicMock()
+                response.__enter__.return_value.read.return_value = json.dumps(catalog).encode()
+                with patch('urllib.request.urlopen', return_value=response):
+                    loaded = carrier.load_catalog(runs)
+                self.assertIsNone(loaded)
+                self.assertIsNone(carrier.catalog_name_error('Vodafone_tr.bundle', loaded))
+                self.assertEqual(carrier.passport_lines('Vodafone_tr.bundle', loaded), [])
+                self.assertEqual(list(pathlib.Path(runs).iterdir()), [])
+
+    def test_invalid_download_preserves_and_uses_stale_cache(self):
+        import os
+        for catalog in self.INVALID_CATALOGS:
+            with self.subTest(catalog=catalog), tempfile.TemporaryDirectory() as runs:
+                cache = pathlib.Path(runs, 'bundles.json')
+                original = json.dumps(self.CATALOG).encode()
+                cache.write_bytes(original)
+                os.utime(cache, (0, 0))
+                response = unittest.mock.MagicMock()
+                response.__enter__.return_value.read.return_value = json.dumps(catalog).encode()
+                with patch('urllib.request.urlopen', return_value=response) as download:
+                    loaded = carrier.load_catalog(runs)
+                download.assert_called_once()
+                self.assertEqual(cache.read_bytes(), original)
+                self.assertEqual([p.name for p in pathlib.Path(runs).iterdir()], ['bundles.json'])
+                self.assertIn('местный номер 13191', '\n'.join(carrier.passport_lines('Vodafone_tr', loaded)))
+
+    def test_wrong_types_in_existing_cache_are_ignored(self):
+        for catalog in self.INVALID_CATALOGS:
+            with self.subTest(catalog=catalog), tempfile.TemporaryDirectory() as runs:
+                pathlib.Path(runs, 'bundles.json').write_text(json.dumps(catalog), encoding='utf-8')
+                with patch('urllib.request.urlopen', side_effect=AssertionError('fresh cache')) as download:
+                    loaded = carrier.load_catalog(runs)
+                download.assert_not_called()
+                self.assertIsNone(loaded)
+                self.assertEqual(carrier.passport_lines('Vodafone_tr', loaded), [])
+
 
 class OutcomeTest(unittest.TestCase):
     def test_rescan_outcome_names_what_ios_chose(self):
