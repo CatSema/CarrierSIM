@@ -138,7 +138,8 @@ def menu(wifi=False):
           '  7  Выбрать другой профиль\n'
           '  8  Диагностика связи (IMS, VoWiFi, VoLTE, 5G) — только чтение\n'
           '  9  Проверка звонка (кодек, канал) — только чтение\n'
-          f'  10 Связь с iPhone: {"Wi-Fi (эксперимент)" if wifi else "кабель"} — переключить\n\n'
+          f'  10 Связь с iPhone: {"Wi-Fi (эксперимент)" if wifi else "кабель"} — переключить\n'
+          '  11 Отчёт о профиле для темы или issue — только чтение\n\n'
           '  0  Выход\n')
     while True:
         choice = input('  Ваш выбор: ').strip()
@@ -151,9 +152,10 @@ def menu(wifi=False):
         if choice == '5': return ['--recover']
         if choice == '7': return other_profile()
         if choice == '8': return ['--diagnose']
+        if choice == '11': return ['--report']
         if choice == '9': return ['--watch-call']
         if choice == '10': return 'wifi'
-        print('Введите число от 0 до 10. Установка ещё не начата.')
+        print('Введите число от 0 до 11. Установка ещё не начата.')
 
 
 def other_profile():

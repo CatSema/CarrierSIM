@@ -242,7 +242,7 @@ class RetryTest(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = pathlib.Path(self.temp.name)
-        self.args = SimpleNamespace(udid=None, wait_seconds=1, diagnose=False, watch_call=False,
+        self.args = SimpleNamespace(udid=None, wait_seconds=1, diagnose=False, watch_call=False, report=False,
                                     attempts=2, runs=self.root, status=False, recover=False)
 
     async def run_case(self, error, before, after):
@@ -299,6 +299,109 @@ class RetryTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(execute.await_count, 2)
             choose.assert_awaited_once()
             self.assertEqual(self.args.udid, 'phone')
+
+
+class ReportTest(unittest.IsolatedAsyncioTestCase):
+    ROWS = [dict(Slot='kOne', MCC='250', MNC='01', CFBundleIdentifier='com.apple.Vodafone_tr', CFBundleVersion='72.0.1',
+                 InternationalMobileSubscriberIdentity='250011234567890', IntegratedCircuitCardIdentity='8970101234567890123')]
+
+    def test_answers_are_normalised_and_masked(self):
+        self.assertEqual(carrier.report_answer(''), 'не проверял')
+        self.assertEqual(carrier.report_answer(' Д '), 'да')
+        self.assertEqual(carrier.report_answer('n'), 'нет')
+        self.assertNotIn('9161234567', carrier.report_answer('звонил на +7 916 123-45-67'))
+
+    async def test_report_has_bundle_and_answers_but_no_identifiers(self):
+        answers = iter(['д', 'н', '', 'n1', 'д', '', '', '', 'Москва'])
+        with tempfile.TemporaryDirectory() as runs, \
+                patch.object(carrier, 'commcenter_stream', AsyncMock()), \
+                patch.object(carrier.sys.stdin, 'isatty', return_value=True), \
+                patch('builtins.input', lambda *_: next(answers)), \
+                patch.dict(carrier.DIAG, {'info': {'ProductType': 'iPhone18,1', 'ProductVersion': '27.0.1',
+                                                   'BuildVersion': '24A446'}}), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            args = SimpleNamespace(runs=pathlib.Path(runs), seconds=10)
+            self.assertEqual(await carrier.run_report(None, args, self.ROWS), 0)
+            saved = next(pathlib.Path(runs).glob('*-report/report.txt')).read_text(encoding='utf-8')
+        self.assertIn(saved.strip(), output.getvalue())
+        for expected in ('iPhone 17 Pro', 'МТС (250-01)', 'Vodafone_tr 72.0.1', 'в авиарежиме по Wi-Fi проходит: да',
+                         'включается сам, без авиарежима: нет', '5G: полоса n в *3001#12345#*: n1', 'Москва'):
+            self.assertIn(expected, saved)
+        for secret in ('250011234567890', '8970101234567890123'):
+            self.assertNotIn(secret, saved)
+
+    async def run_with(self, answers):
+        def answer(*_):
+            item = next(answers)
+            if isinstance(item, BaseException): raise item
+            return item
+        with tempfile.TemporaryDirectory() as runs, \
+                patch.object(carrier, 'commcenter_stream', AsyncMock()), \
+                patch.object(carrier.sys.stdin, 'isatty', return_value=True), \
+                patch('builtins.input', answer), \
+                patch.dict(carrier.DIAG, {'info': {'ProductType': 'iPhone18,1'}}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(await carrier.run_report(None, SimpleNamespace(runs=pathlib.Path(runs), seconds=10), self.ROWS), 0)
+            return next(pathlib.Path(runs).glob('*-report/report.txt')).read_text(encoding='utf-8')
+
+    async def test_region_is_free_text_not_a_yes_no_answer(self):
+        saved = await self.run_with(iter([''] * 8 + ['н']))
+        self.assertIn(' · н', saved)
+
+    async def test_interrupted_questions_still_save_the_report(self):
+        for stop in (EOFError(), KeyboardInterrupt()):
+            saved = await self.run_with(iter(['д', stop]))
+            self.assertIn('вопросы прерваны', saved)
+            self.assertIn('Журнал CommCenter', saved)
+            self.assertIn('в авиарежиме по Wi-Fi проходит: да', saved)  # the interrupted SIM keeps its answer
+
+    async def test_ctrl_c_interrupts_the_question_itself(self):
+        # Under asyncio.run the first Ctrl-C only cancels the task; while asking it must reach input().
+        import signal
+        handlers = []
+        def answer(*_):
+            handlers.append(signal.getsignal(signal.SIGINT)); return ''
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            with tempfile.TemporaryDirectory() as runs, \
+                    patch.object(carrier, 'commcenter_stream', AsyncMock()), \
+                    patch.object(carrier.sys.stdin, 'isatty', return_value=True), \
+                    patch('builtins.input', answer), \
+                    patch.dict(carrier.DIAG, {'info': {'ProductType': 'iPhone18,1'}}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                await carrier.run_report(None, SimpleNamespace(runs=pathlib.Path(runs), seconds=10), self.ROWS)
+            after = signal.getsignal(signal.SIGINT)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        self.assertTrue(handlers)
+        self.assertTrue(all(h is signal.default_int_handler for h in handlers))
+        self.assertIs(after, signal.SIG_IGN)  # the caller's handler is back after the questions
+
+
+class ReportNoTtyTest(unittest.IsolatedAsyncioTestCase):
+    async def test_without_a_terminal_the_report_says_questions_were_skipped(self):
+        rows = [dict(Slot='kOne', MCC='250', MNC='02', CFBundleIdentifier='com.apple.MTS_ua', CFBundleVersion='72.0')]
+        with tempfile.TemporaryDirectory() as runs, \
+                patch.object(carrier, 'commcenter_stream', AsyncMock()), \
+                patch.object(carrier.sys.stdin, 'isatty', return_value=False), \
+                patch('builtins.input', side_effect=AssertionError('must not ask')), \
+                patch.dict(carrier.DIAG, {'info': {'ProductType': 'iPhone17,2'}}), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            await carrier.run_report(None, SimpleNamespace(runs=pathlib.Path(runs), seconds=10), rows)
+            saved = next(pathlib.Path(runs).glob('*-report/report.txt')).read_text(encoding='utf-8')
+        self.assertIn('Ручные проверки: не заданы', saved)
+        self.assertIn('пункт 11 из меню', output.getvalue())
+
+    async def test_terminal_without_sim_slots_does_not_blame_the_terminal(self):
+        with tempfile.TemporaryDirectory() as runs, \
+                patch.object(carrier, 'commcenter_stream', AsyncMock()), \
+                patch.object(carrier.sys.stdin, 'isatty', return_value=True), \
+                patch('builtins.input', return_value=''), \
+                patch.dict(carrier.DIAG, {'info': {'ProductType': 'iPhone17,2'}}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            await carrier.run_report(None, SimpleNamespace(runs=pathlib.Path(runs), seconds=10), [dict(MCC='250')])
+            saved = next(pathlib.Path(runs).glob('*-report/report.txt')).read_text(encoding='utf-8')
+        self.assertNotIn('без терминала', saved)
 
 
 class LogStreamTest(unittest.IsolatedAsyncioTestCase):
