@@ -734,18 +734,74 @@ class LocalNetworkTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await carrier.execute_with_retry(args, {}), 0)
             check.assert_not_called()
 
-    async def test_nothing_to_recover_over_wifi_skips_the_check(self):
+    async def test_recover_over_wifi_skips_the_early_check(self):
         args = SimpleNamespace(udid=None, wait_seconds=1, diagnose=False, watch_call=False, report=False,
                                attempts=1, runs=pathlib.Path('.'), status=False, recover=pathlib.Path('AUTO'))
-        for unresolved, checked in (([], False), (['stage'], True)):
-            with self.subTest(unresolved=unresolved), patch.object(carrier, 'CONNECTION', 'Network'), \
-                 patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
-                 patch.object(carrier, 'pending', return_value=unresolved), \
-                 patch.object(carrier, 'local_network_denied', return_value=False) as check, \
-                 patch.object(carrier, 'execute', AsyncMock(return_value=0)), \
-                 contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(await carrier.execute_with_retry(args, {}), 0)
-                self.assertEqual(check.called, checked)
+        with patch.object(carrier, 'CONNECTION', 'Network'), \
+             patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
+             patch.object(carrier, 'pending', return_value=['stage']), \
+             patch.object(carrier, 'local_network_denied', return_value=True) as check, \
+             patch.object(carrier, 'execute', AsyncMock(return_value=0)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(await carrier.execute_with_retry(args, {}), 0)
+            check.assert_not_called()
+
+    async def test_denied_rollback_is_not_retried_by_auto_recovery(self):
+        args = SimpleNamespace(udid=None, wait_seconds=1, diagnose=False, watch_call=False, report=False,
+                               attempts=2, runs=pathlib.Path('.'), status=False, recover=pathlib.Path('AUTO'))
+        with patch.object(carrier, 'CONNECTION', 'Network'), \
+             patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
+             patch.object(carrier, 'pending', return_value=['stage']), \
+             patch.object(carrier, 'execute', AsyncMock(side_effect=carrier.LocalNetworkDenied('x'))) as execute, \
+             patch.object(carrier, 'recover_all', AsyncMock()) as recover_all, \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(carrier.LocalNetworkDenied):
+                await carrier.execute_with_retry(args, {})
+            recover_all.assert_not_awaited()
+            self.assertEqual(execute.await_count, 1)
+
+    def stage(self, root, **journal):
+        folder = root / 'stage'; folder.mkdir()
+        carrier.write_tree_zip(folder / 'books.zip', {})
+        carrier.save_json(folder / 'books.json', {'hash': carrier.tree_hash({}), 'existed': True})
+        catalog = {'catalog': ('d', b'')}
+        carrier.write_tree_zip(folder / 'original.zip', catalog)
+        carrier.save_json(folder / 'journal.json', {'target': carrier.TARGET, 'udid_hash': carrier.digest(b'phone'),
+            'exported': 'airlift-saved-' + 'a' * 20, 'original_hash': carrier.tree_hash(catalog), **journal})
+        return folder
+
+    def offline_recovery(self, stack):
+        # A denied Local Network, an empty phone and mocked AFC: what recover_stage reaches is what it needs.
+        afc = AsyncMock(); afc.__aenter__.return_value = afc
+        stack.enter_context(patch.object(carrier, 'CONNECTION', 'Network'))
+        stack.enter_context(patch('pymobiledevice3.services.afc.AfcService', return_value=afc))
+        stack.enter_context(patch.object(carrier, 'exists', AsyncMock(return_value=False)))
+        stack.enter_context(patch.object(carrier, 'local_network_denied', return_value=True))
+        return (stack.enter_context(patch.object(carrier, 'restore_books', AsyncMock(return_value=[]))),
+                stack.enter_context(patch.object(carrier, 'transfer', AsyncMock())))
+
+    async def test_books_only_rollback_needs_no_local_network(self):
+        # Carrier stage finished with Books left; and an early stage whose catalog never left.
+        for journal in ({'complete': True, 'phase': 'placement-observed'}, {'complete': False, 'phase': 'staging'}):
+            with self.subTest(journal=journal), tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as stack:
+                root = pathlib.Path(temp)
+                folder = self.stage(root, **journal); (folder / 'original.zip').unlink()
+                books, transfer = self.offline_recovery(stack)
+                await carrier.recover_stage(SimpleNamespace(udid='phone'), folder, root)
+                books.assert_awaited_once()
+                transfer.assert_not_awaited()
+                self.assertEqual(carrier.read_json(folder / 'journal.json')['recovered_by'], str(root))
+
+    async def test_catalog_rollback_stops_on_denied_local_network(self):
+        with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as stack:
+            root = pathlib.Path(temp)
+            folder = self.stage(root, complete=False, phase='placement', requires_recovery=True)
+            books, transfer = self.offline_recovery(stack)
+            with self.assertRaises(carrier.LocalNetworkDenied):
+                await carrier.recover_stage(SimpleNamespace(udid='phone'), folder, root)
+            books.assert_awaited_once()
+            transfer.assert_not_awaited()
+            self.assertNotIn('recovered_by', carrier.read_json(folder / 'journal.json'))
 
 
 class VersionTest(unittest.TestCase):

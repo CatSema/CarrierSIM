@@ -903,11 +903,21 @@ def native_host(udid, assets, directories):
         host.close()
 
 
-LOCAL_NETWORK_HINT = ('macOS не пускает этот терминал в локальную сеть, а AirTraffic по Wi-Fi соединяется '
-    'с iPhone напрямую. Разрешите терминалу доступ: «Системные настройки → Конфиденциальность и безопасность → '
+LOCAL_NETWORK_HINT = ('Похоже, macOS не пускает этот терминал в локальную сеть: iPhone по Wi-Fi отклонил '
+    'соединение мгновенно, а AirTraffic соединяется с ним напрямую. Разрешите терминалу доступ: «Системные настройки → Конфиденциальность и безопасность → '
     'Локальная сеть». Из tmux, screen или SSH macOS разрешения не спрашивает: запустите «Запуск macOS.command» '
     '(в готовой сборке — CarrierSIM) из Finder или обычное окно терминала, либо подключите кабель и переключите связь на кабель (пункт 10). '
     'Если разрешение уже есть, проверьте, что iPhone в той же сети Wi-Fi и не спит')
+
+
+class LocalNetworkDenied(RuntimeError):
+    pass
+
+
+async def require_local_network(udid):
+    # Only AirTraffic needs it: installs, and rollbacks that write the catalog back. Books goes through AFC.
+    if CONNECTION=='Network' and await asyncio.to_thread(local_network_denied,udid):
+        raise LocalNetworkDenied(LOCAL_NETWORK_HINT)
 
 
 # macOS refuses a denied connect in about 1 ms; a real "no route" takes neighbor discovery's seconds.
@@ -1349,11 +1359,10 @@ async def execute_with_retry(args,assets):
     if args.diagnose or args.watch_call or args.report:
         # Read-only: no retries and no auto-recovery, which would write to the phone.
         return await diagnostics(args)
-    # "Nothing to recover" needs no AirTraffic: let it say so instead of stopping on the check.
-    idle_recover=args.recover==Path('AUTO') and not pending(args.runs,args.udid)
-    if CONNECTION=='Network' and not args.status and not idle_recover:
-        # Before any stage: AirTraffic (install and rollback alike) needs a direct connection.
-        require(not await asyncio.to_thread(local_network_denied,args.udid),LOCAL_NETWORK_HINT)
+    if not args.status and not args.recover:
+        # Before any stage: an install needs AirTraffic. A rollback checks only before its AirTraffic
+        # step (recover_stage): stages with only Books left go through AFC and need no direct connection.
+        await require_local_network(args.udid)
     for attempt in range(1,args.attempts+1):
         print(f'Попытка {attempt} из {args.attempts}',flush=True)
         before=set(pending(args.runs,args.udid))
@@ -1362,7 +1371,8 @@ async def execute_with_retry(args,assets):
             # Roll back after any failure; retry only when a new attempt can change the outcome.
             # --status only reads: its failure must never start a recovery that writes to the phone.
             # Stages left by earlier launches are rolled back only when recovery was asked for.
-            failed=[] if args.status else [p for p in pending(args.runs,args.udid) if args.recover or p not in before]
+            # A denied Local Network would stop the auto-recovery's AirTraffic step the same way.
+            failed=[] if args.status or isinstance(error,LocalNetworkDenied) else [p for p in pending(args.runs,args.udid) if args.recover or p not in before]
             if failed:
                 print('Сбой во время записи. Сначала возвращаю iPhone в исходное состояние…',flush=True)
                 device=await ready_device(args.udid,args.wait_seconds)
@@ -1495,6 +1505,7 @@ async def recover_stage(device, failed, run, tag=''):
                     'Нет проверенной копии. Сохраните runs; восстановление остановлено.')
         if (other:=await restore_books(afc,books,state['existed'],state.get('top'))):record['books_other_changes']=other[:50]
     if desired is not None:
+        await require_local_network(device.udid)
         write_tree_zip(run/f'recovery-original{tag}.zip',desired)
         await transfer(device,run/f'recover{tag}',payload=desired,recovery=True)
         observed=await transfer(device,run/f'readback{tag}')
