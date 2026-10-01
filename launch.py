@@ -15,6 +15,7 @@ from carriersim_version import VERSION
 
 ROOT = Path(__file__).resolve().parent
 UNCONFIRMED = 3  # carrier.py: written, but iOS did not confirm the chosen bundle
+NOTHING_TO_WRITE = 4  # carrier.py --status with CARRIERSIM_PLAN=1: the plan writes nothing
 
 
 def run_carrier(python, args, **kwargs):
@@ -160,7 +161,16 @@ def other_profile():
         if not name: return False
         if re.fullmatch(r'[A-Za-z0-9_]+', name): break
         print('  Только латинские буквы, цифры и _. Например: O2_Germany.')
-    return ['--bundle', name, '--sims', choose_sims('На какие SIM установить?')]
+    # A tuple asks main() to show the plan and the bundle passport first and write only after a yes.
+    return ('confirm', ['--bundle', name, '--sims', choose_sims('На какие SIM установить?')])
+
+
+def ask_yes(question):
+    while True:
+        answer = input(question).strip().lower()
+        if answer in ('', 'д', 'да', 'y', 'yes'): return True
+        if answer in ('н', 'нет', 'n', 'no'): return False
+        print('  Введите «д» или «н».')
 
 
 def choose_sims(question):
@@ -186,6 +196,8 @@ def main():
         args = menu(wifi)
         if args is None: return 0
         if args is False: continue
+        confirm = isinstance(args, tuple)
+        if confirm: args = args[1]
         if args == 'wifi':
             wifi = not wifi
             if wifi:
@@ -198,7 +210,14 @@ def main():
         print('\n' + '─' * 56, flush=True)
         try:
             if python is None: python = python_environment()
-            code = run_carrier(python, args, env={**os.environ, 'CARRIERSIM_MENU': '1'})
+            env = {**os.environ, 'CARRIERSIM_MENU': '1'}
+            code = run_carrier(python, [*args, '--status'], env={**env, 'CARRIERSIM_PLAN': '1'}) if confirm else 0
+            if code == NOTHING_TO_WRITE:
+                print('\n  Записывать нечего, установка не запущена. Причина указана выше.'); code = 0
+            elif confirm and not code and not ask_yes('\n  Записать этот профиль? Enter или «д» — да, «н» — нет: '):
+                print('Установка не запущена.')
+            elif not code:
+                code = run_carrier(python, args, env=env)
             if code == UNCONFIRMED:
                 print('\nВыбор профиля не подтверждён. Подробности — в журнале операции.')
             elif code:

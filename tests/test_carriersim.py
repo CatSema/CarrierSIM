@@ -301,6 +301,96 @@ class RetryTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.args.udid, 'phone')
 
 
+class CatalogTest(unittest.TestCase):
+    CATALOG = {'meta': {'ios': '27.0', 'deviceName': 'iPhone 17'},
+               'bundles': [{'b': 'Vodafone_tr', 'country': 'Turkey', 'reg': '13191', 'ih': 'cellular', 'wroam': True,
+                            'wn': 'vodafone TR Wi-Fi', 'lte': '4G', 'vs': False, 'evs': True, 'xcap': True, 'vvm': 'none'},
+                           {'b': 'Vodafone_ro', 'reg': '+447786205094', 'ih': 'ims', 'wroam': False},
+                           {'b': 'Exit_zero', 'reg': '00447786205094'}]}
+
+    def load(self):
+        with tempfile.TemporaryDirectory() as runs:
+            pathlib.Path(runs, 'bundles.json').write_text(json.dumps(self.CATALOG), encoding='utf-8')
+            with patch('urllib.request.urlopen', side_effect=AssertionError('fresh cache must not be refetched')):
+                return carrier.load_catalog(runs)
+
+    def test_passport_from_cache_warns_about_short_imessage_number(self):
+        catalog = self.load()
+        text = '\n'.join(carrier.passport_lines('Vodafone_tr.bundle', catalog))
+        self.assertIn('местный номер 13191', text)
+        self.assertIn('в роуминге — да', text)
+        self.assertIn('приоритет дома — сотовая', text)
+        self.assertIn('международный номер', '\n'.join(carrier.passport_lines('Vodafone_ro', catalog)))
+        self.assertIn('Похожие: Vodafone_tr', carrier.passport_lines('Vodafon_tr', catalog)[0])
+        self.assertIn('международный номер', '\n'.join(carrier.passport_lines('Exit_zero', catalog)))
+
+    def test_case_only_mismatch_is_an_error_and_missing_catalog_is_silent(self):
+        catalog = self.load()
+        self.assertIn('Vodafone_tr', carrier.catalog_name_error('vodafone_TR.bundle', catalog))
+        self.assertIsNone(carrier.catalog_name_error('Vodafone_tr.bundle', catalog))
+        self.assertFalse(carrier.catalog_name_error('Unknown_xx', catalog))
+        self.assertIsNone(carrier.catalog_name_error('vodafone_tr', None))
+        self.assertEqual(carrier.passport_lines('Vodafone_tr', None), [])
+        with tempfile.TemporaryDirectory() as runs, \
+                patch('urllib.request.urlopen', side_effect=OSError('offline')):
+            self.assertIsNone(carrier.load_catalog(runs))
+
+    def test_downloaded_table_is_cached_atomically(self):
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(self.CATALOG).encode()
+        with tempfile.TemporaryDirectory() as runs, patch('urllib.request.urlopen', return_value=response):
+            self.assertIsNotNone(carrier.load_catalog(runs))
+            self.assertEqual([p.name for p in pathlib.Path(runs).iterdir()], ['bundles.json'])
+
+    INVALID_CATALOGS = (
+        None, [], {'meta': None, 'bundles': [{'b': 'Vodafone_tr'}]},
+        {'meta': [], 'bundles': []}, {'bundles': None}, {'bundles': {}},
+        {'bundles': [None]}, {'bundles': [{'b': 123}]}, {'bundles': [{'b': True}]},
+        {'bundles': [{'b': None}]}, {'bundles': [{'b': ''}]}, {'bundles': [{}]},
+        {'bundles': [{'b': 'Vodafone_tr', 'ih': []}]},
+        {'bundles': [{'b': 'Vodafone_tr', 'ih': {}}]},
+    )
+
+    def test_wrong_json_types_skip_passport_without_creating_cache(self):
+        for catalog in self.INVALID_CATALOGS:
+            with self.subTest(catalog=catalog), tempfile.TemporaryDirectory() as runs:
+                response = unittest.mock.MagicMock()
+                response.__enter__.return_value.read.return_value = json.dumps(catalog).encode()
+                with patch('urllib.request.urlopen', return_value=response):
+                    loaded = carrier.load_catalog(runs)
+                self.assertIsNone(loaded)
+                self.assertIsNone(carrier.catalog_name_error('Vodafone_tr.bundle', loaded))
+                self.assertEqual(carrier.passport_lines('Vodafone_tr.bundle', loaded), [])
+                self.assertEqual(list(pathlib.Path(runs).iterdir()), [])
+
+    def test_invalid_download_preserves_and_uses_stale_cache(self):
+        import os
+        for catalog in self.INVALID_CATALOGS:
+            with self.subTest(catalog=catalog), tempfile.TemporaryDirectory() as runs:
+                cache = pathlib.Path(runs, 'bundles.json')
+                original = json.dumps(self.CATALOG).encode()
+                cache.write_bytes(original)
+                os.utime(cache, (0, 0))
+                response = unittest.mock.MagicMock()
+                response.__enter__.return_value.read.return_value = json.dumps(catalog).encode()
+                with patch('urllib.request.urlopen', return_value=response) as download:
+                    loaded = carrier.load_catalog(runs)
+                download.assert_called_once()
+                self.assertEqual(cache.read_bytes(), original)
+                self.assertEqual([p.name for p in pathlib.Path(runs).iterdir()], ['bundles.json'])
+                self.assertIn('местный номер 13191', '\n'.join(carrier.passport_lines('Vodafone_tr', loaded)))
+
+    def test_wrong_types_in_existing_cache_are_ignored(self):
+        for catalog in self.INVALID_CATALOGS:
+            with self.subTest(catalog=catalog), tempfile.TemporaryDirectory() as runs:
+                pathlib.Path(runs, 'bundles.json').write_text(json.dumps(catalog), encoding='utf-8')
+                with patch('urllib.request.urlopen', side_effect=AssertionError('fresh cache')) as download:
+                    loaded = carrier.load_catalog(runs)
+                download.assert_not_called()
+                self.assertIsNone(loaded)
+                self.assertEqual(carrier.passport_lines('Vodafone_tr', loaded), [])
+
+
 class OutcomeTest(unittest.TestCase):
     def test_rescan_outcome_names_what_ios_chose(self):
         r = lambda selected, verified=True: {'expected': 'Vodafone_tr.bundle', 'selected': selected, 'verified': verified}
@@ -322,6 +412,34 @@ class VersionTest(unittest.TestCase):
         with patch('builtins.input', return_value='0'), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertIsNone(launch.menu())
         self.assertIn(f'CarrierSIM {VERSION}', output.getvalue())
+
+    def test_other_profile_shows_plan_and_writes_only_after_yes(self):
+        for answer, runs in (('', 2), ('д', 2), ('н', 1)):
+            # menu: 7, bundle name, SIM 2, then the confirmation, "press Enter", and 0 to quit.
+            inputs = iter(['7', 'Vodafone_tr', '2', answer, '', '0'])
+            with self.subTest(answer=answer), patch('builtins.input', lambda *_: next(inputs)), \
+                    patch.object(launch, 'check_writable'), patch.object(launch, 'python_environment'), \
+                    patch.object(launch, 'run_carrier', return_value=0) as run, patch.object(sys, 'argv', ['launch.py']), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(launch.main(), 0)
+            calls = [c.args[1] for c in run.call_args_list]
+            self.assertEqual(len(calls), runs)
+            self.assertEqual(calls[0], ['--bundle', 'Vodafone_tr', '--sims', '2', '--status'])
+            if runs == 2: self.assertEqual(calls[1], ['--bundle', 'Vodafone_tr', '--sims', '2'])
+
+    def test_other_profile_does_not_ask_when_the_plan_writes_nothing(self):
+        # menu: 7, bundle name, SIM 2, "press Enter", and 0 to quit — no confirmation question.
+        inputs = iter(['7', 'Vodafone_tr', '2', '', '0'])
+        with patch('builtins.input', lambda *_: next(inputs)), \
+                patch.object(launch, 'check_writable'), patch.object(launch, 'python_environment'), \
+                patch.object(launch, 'run_carrier', return_value=launch.NOTHING_TO_WRITE) as run, \
+                patch.object(sys, 'argv', ['launch.py']), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(launch.main(), 0)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.kwargs['env']['CARRIERSIM_PLAN'], '1')
+        self.assertIn('Записывать нечего', output.getvalue())
+        self.assertNotIn('Действие не завершено', output.getvalue())
+        self.assertEqual(launch.NOTHING_TO_WRITE, carrier.NOTHING_TO_WRITE)
 
     def test_log_environment_and_error_report_identify_version(self):
         with tempfile.TemporaryDirectory() as directory:
