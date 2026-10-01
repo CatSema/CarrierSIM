@@ -942,6 +942,91 @@ def native_host(udid, assets, directories):
         host.close()
 
 
+LOCAL_NETWORK_HINT = ('Похоже, macOS не пускает этот терминал в локальную сеть: iPhone по Wi-Fi отклонил '
+    'соединение мгновенно, а AirTraffic соединяется с ним напрямую. Разрешите терминалу доступ: «Системные настройки → Конфиденциальность и безопасность → '
+    'Локальная сеть». Из tmux, screen или SSH macOS разрешения не спрашивает: запустите «Запуск macOS.command» '
+    '(в готовой сборке — CarrierSIM) из Finder или обычное окно терминала, либо подключите кабель и переключите связь на кабель (пункт 10). '
+    'Если разрешение уже есть, проверьте, что iPhone в той же сети Wi-Fi и не спит')
+
+
+class LocalNetworkDenied(RuntimeError):
+    pass
+
+
+# macOS may refuse at once while its Local Network alert is still on screen, and may not show the
+# alert at all to a process that exits right after the refusal (TN3179): ask again for this long.
+LOCAL_NETWORK_WAIT = 20
+
+
+async def require_local_network(udid):
+    # Only AirTraffic needs it: installs, and rollbacks that write the catalog back. Books goes through AFC.
+    if CONNECTION!='Network' or not await asyncio.to_thread(local_network_denied,udid): return
+    print(f'Похоже, macOS не пускает терминал в локальную сеть. Если появилось окно «Локальная сеть», '
+          f'нажмите «Разрешить». Жду до {LOCAL_NETWORK_WAIT} с…',flush=True)
+    for _ in range(LOCAL_NETWORK_WAIT):
+        await asyncio.sleep(1)
+        if not await asyncio.to_thread(local_network_denied,udid): return
+    raise LocalNetworkDenied(LOCAL_NETWORK_HINT)
+
+
+# macOS refuses a denied connect in about 1 ms; a real "no route" takes neighbor discovery's seconds.
+LOCAL_NETWORK_REFUSAL = 0.5
+
+
+def usbmux_network_address(udid):
+    # pymobiledevice3 drops NetworkAddress from its device list, so ask usbmuxd directly: the system
+    # socket, which Apple's MobileDevice uses too. None also when the phone is on USB as well: then
+    # MobileDevice picks the cable and the direct Wi-Fi path does not matter.
+    import socket
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(5); s.connect('/var/run/usbmuxd')
+        body = plistlib.dumps({'MessageType': 'ListDevices', 'ProgName': 'CarrierSIM', 'ClientVersionString': VERSION})
+        s.sendall(struct.pack('<IIII', 16 + len(body), 1, 8, 1) + body)
+        def read(n):
+            data = b''
+            while len(data) < n:
+                chunk = s.recv(n - len(data)); require(chunk, 'usbmuxd закрыл соединение')
+                data += chunk
+            return data
+        devices = plistlib.loads(read(struct.unpack('<I', read(16)[:4])[0] - 16)).get('DeviceList', [])
+    mine = [d.get('Properties', {}) for d in devices if d.get('Properties', {}).get('SerialNumber') == udid]
+    if any(p.get('ConnectionType') == 'USB' for p in mine): return None
+    return next((sockaddr(p['NetworkAddress']) for p in mine
+                 if p.get('ConnectionType') == 'Network' and p.get('NetworkAddress')), None)
+
+
+def sockaddr(raw):
+    # BSD sockaddr: length, family, port, then sockaddr_in or sockaddr_in6 fields.
+    import socket
+    if raw[1] == socket.AF_INET6:
+        return socket.AF_INET6, (socket.inet_ntop(socket.AF_INET6, raw[8:24]), 62078, 0,
+                                 int.from_bytes(raw[24:28], sys.byteorder))
+    if raw[1] == socket.AF_INET:
+        return socket.AF_INET, (socket.inet_ntop(socket.AF_INET, raw[4:8]), 62078)
+    return None
+
+
+def local_network_denied(udid):
+    # Over Wi-Fi, Apple's MobileDevice inside the AirTraffic host connects to the phone itself, not
+    # through usbmuxd. macOS "Local Network" privacy refuses that in 1 ms with EHOSTUNREACH, and the
+    # host then waits silently until its deadline, while pymobiledevice3 (via usbmuxd) keeps working.
+    # Only a definite refusal counts: any other outcome lets the run go on. A phone that is really
+    # unreachable gives the same errno, but only after neighbor discovery gives up (seconds).
+    import socket
+    if sys.platform != 'darwin': return False
+    started = None
+    try:
+        address = usbmux_network_address(udid)
+        if address is None: return False
+        with socket.socket(address[0], socket.SOCK_STREAM) as s:
+            s.settimeout(3); started = time.monotonic(); s.connect(address[1])
+    except OSError as error:
+        return error.errno == 65 and started is not None and time.monotonic() - started < LOCAL_NETWORK_REFUSAL  # EHOSTUNREACH
+    except Exception:
+        return False
+    return False
+
+
 def host_command():
     return [sys.executable, '--carrier', '--_host'] if FROZEN else [sys.executable, str(SELF), '--_host']
 
@@ -1324,6 +1409,11 @@ async def execute_with_retry(args,assets):
     if args.diagnose or args.watch_call or args.report:
         # Read-only: no retries and no auto-recovery, which would write to the phone.
         return await diagnostics(args)
+    # Before any stage: an install needs AirTraffic. A rollback checks only before its AirTraffic
+    # step (recover_stage): stages with only Books left go through AFC and need no direct connection.
+    # An unfinished stage stops the install anyway (execute): say that first, not the permission.
+    if CONNECTION=='Network' and not args.status and not args.recover and not pending(args.runs,args.udid):
+        await require_local_network(args.udid)
     for attempt in range(1,args.attempts+1):
         print(f'Попытка {attempt} из {args.attempts}',flush=True)
         before=set(pending(args.runs,args.udid))
@@ -1332,7 +1422,8 @@ async def execute_with_retry(args,assets):
             # Roll back after any failure; retry only when a new attempt can change the outcome.
             # --status only reads: its failure must never start a recovery that writes to the phone.
             # Stages left by earlier launches are rolled back only when recovery was asked for.
-            failed=[] if args.status else [p for p in pending(args.runs,args.udid) if args.recover or p not in before]
+            # A denied Local Network would stop the auto-recovery's AirTraffic step the same way.
+            failed=[] if args.status or isinstance(error,LocalNetworkDenied) else [p for p in pending(args.runs,args.udid) if args.recover or p not in before]
             if failed:
                 print('Сбой во время записи. Сначала возвращаю iPhone в исходное состояние…',flush=True)
                 device=await ready_device(args.udid,args.wait_seconds)
@@ -1465,6 +1556,7 @@ async def recover_stage(device, failed, run, tag=''):
                     'Нет проверенной копии. Сохраните runs; восстановление остановлено.')
         if (other:=await restore_books(afc,books,state['existed'],state.get('top'))):record['books_other_changes']=other[:50]
     if desired is not None:
+        await require_local_network(device.udid)
         write_tree_zip(run/f'recovery-original{tag}.zip',desired)
         await transfer(device,run/f'recover{tag}',payload=desired,recovery=True)
         observed=await transfer(device,run/f'readback{tag}')

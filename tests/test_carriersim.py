@@ -696,6 +696,179 @@ class GrappaTest(unittest.TestCase):
             self.assertIsNone(carrier.grappa_failure(RuntimeError(cause), log))
 
 
+class LocalNetworkTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        patcher = patch.object(carrier, 'LOCAL_NETWORK_WAIT', 0)
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def test_sockaddr_ipv6_and_ipv4(self):
+        import socket
+        ipv6 = bytes([28, socket.AF_INET6, 0xf2, 0x7e]) + bytes(4) + \
+            bytes.fromhex('fe800000000000001c2d7734a92c3e3a') + (12).to_bytes(4, sys.byteorder)
+        self.assertEqual(carrier.sockaddr(ipv6), (socket.AF_INET6, ('fe80::1c2d:7734:a92c:3e3a', 62078, 0, 12)))
+        ipv4 = bytes([16, socket.AF_INET, 0, 0, 192, 168, 1, 5]) + bytes(8)
+        self.assertEqual(carrier.sockaddr(ipv4), (socket.AF_INET, ('192.168.1.5', 62078)))
+
+    def denied(self, error):
+        import socket
+        sock = unittest.mock.MagicMock()
+        sock.__enter__.return_value.connect.side_effect = error
+        with patch.object(carrier.sys, 'platform', 'darwin'), \
+             patch.object(carrier, 'usbmux_network_address', return_value=(socket.AF_INET6, ('fe80::1', 62078, 0, 12))), \
+             patch('socket.socket', return_value=sock):
+            return carrier.local_network_denied('phone')
+
+    def test_only_ehostunreach_counts_as_denied(self):
+        self.assertTrue(self.denied(OSError(65, 'No route to host')))
+        self.assertFalse(self.denied(OSError(61, 'Connection refused')))
+        self.assertFalse(self.denied(TimeoutError()))
+        self.assertFalse(self.denied(None))
+
+    def test_slow_ehostunreach_is_a_missing_phone_not_a_refusal(self):
+        with patch.object(carrier.time, 'monotonic', side_effect=[0.0, 2.0]):
+            self.assertFalse(self.denied(OSError(65, 'No route to host')))
+
+    def usbmux(self, *devices):
+        import plistlib, socket, struct
+        body = plistlib.dumps({'DeviceList': [{'DeviceID': i, 'Properties': p} for i, p in enumerate(devices)]})
+        data = bytearray(struct.pack('<IIII', 16 + len(body), 1, 8, 1) + body)
+        sock = unittest.mock.MagicMock()
+        def recv(n):
+            chunk = bytes(data[:n]); del data[:n]; return chunk
+        sock.__enter__.return_value.recv.side_effect = recv
+        with patch('socket.socket', return_value=sock):
+            return carrier.usbmux_network_address('phone')
+
+    @unittest.skipUnless(hasattr(__import__('socket'), 'AF_UNIX'), 'usbmuxd socket is macOS-only')
+    def test_usbmux_address_and_cable_skip(self):
+        import socket
+        raw = bytes([16, socket.AF_INET, 0, 0, 192, 168, 1, 5]) + bytes(8)
+        wifi = {'SerialNumber': 'phone', 'ConnectionType': 'Network', 'NetworkAddress': raw}
+        self.assertEqual(self.usbmux(wifi), (socket.AF_INET, ('192.168.1.5', 62078)))
+        self.assertIsNone(self.usbmux(wifi, {'SerialNumber': 'phone', 'ConnectionType': 'USB'}))
+        self.assertIsNone(self.usbmux({**wifi, 'SerialNumber': 'other'}))
+
+    def test_unknown_address_or_other_platform_is_not_denied(self):
+        with patch.object(carrier.sys, 'platform', 'darwin'), \
+             patch.object(carrier, 'usbmux_network_address', return_value=None):
+            self.assertFalse(carrier.local_network_denied('phone'))
+        with patch.object(carrier.sys, 'platform', 'win32'), \
+             patch.object(carrier, 'usbmux_network_address') as address:
+            self.assertFalse(carrier.local_network_denied('phone'))
+            address.assert_not_called()
+
+    async def test_denied_wifi_stops_before_any_stage(self):
+        args = SimpleNamespace(udid=None, wait_seconds=1, diagnose=False, watch_call=False, report=False,
+                               attempts=2, runs=pathlib.Path('.'), status=False, recover=False)
+        with patch.object(carrier, 'CONNECTION', 'Network'), \
+             patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
+             patch.object(carrier, 'pending', return_value=[]), \
+             patch.object(carrier, 'local_network_denied', return_value=True), \
+             patch.object(carrier, 'execute', AsyncMock()) as execute, \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'Локальная сеть'):
+                await carrier.execute_with_retry(args, {})
+            execute.assert_not_awaited()
+        args.status = True
+        with patch.object(carrier, 'CONNECTION', 'Network'), \
+             patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
+             patch.object(carrier, 'local_network_denied', return_value=True) as check, \
+             patch.object(carrier, 'execute', AsyncMock(return_value=0)):
+            self.assertEqual(await carrier.execute_with_retry(args, {}), 0)
+            check.assert_not_called()
+
+    async def test_allowing_in_the_alert_lets_the_install_go_on(self):
+        # The first probe is refused while macOS shows its alert; the next one, after "Allow", passes.
+        with patch.object(carrier, 'CONNECTION', 'Network'), patch.object(carrier, 'LOCAL_NETWORK_WAIT', 3), \
+             patch.object(carrier, 'local_network_denied', side_effect=[True, True, False]) as check, \
+             patch.object(carrier.asyncio, 'sleep', AsyncMock()), contextlib.redirect_stdout(io.StringIO()) as out:
+            await carrier.require_local_network('phone')
+        self.assertEqual(check.call_count, 3)
+        self.assertIn('Разрешить', out.getvalue())
+
+    async def test_unfinished_stage_is_reported_before_the_permission(self):
+        args = SimpleNamespace(udid=None, wait_seconds=1, diagnose=False, watch_call=False, report=False,
+                               attempts=1, runs=pathlib.Path('.'), status=False, recover=False)
+        with patch.object(carrier, 'CONNECTION', 'Network'), \
+             patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
+             patch.object(carrier, 'pending', return_value=['stage']), \
+             patch.object(carrier, 'local_network_denied', return_value=True) as check, \
+             patch.object(carrier, 'execute', AsyncMock(side_effect=RuntimeError('Прошлая операция не завершилась'))), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'Прошлая операция'):
+                await carrier.execute_with_retry(args, {})
+            check.assert_not_called()
+
+    async def test_recover_over_wifi_skips_the_early_check(self):
+        args = SimpleNamespace(udid=None, wait_seconds=1, diagnose=False, watch_call=False, report=False,
+                               attempts=1, runs=pathlib.Path('.'), status=False, recover=pathlib.Path('AUTO'))
+        with patch.object(carrier, 'CONNECTION', 'Network'), \
+             patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
+             patch.object(carrier, 'pending', return_value=['stage']), \
+             patch.object(carrier, 'local_network_denied', return_value=True) as check, \
+             patch.object(carrier, 'execute', AsyncMock(return_value=0)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(await carrier.execute_with_retry(args, {}), 0)
+            check.assert_not_called()
+
+    async def test_denied_rollback_is_not_retried_by_auto_recovery(self):
+        args = SimpleNamespace(udid=None, wait_seconds=1, diagnose=False, watch_call=False, report=False,
+                               attempts=2, runs=pathlib.Path('.'), status=False, recover=pathlib.Path('AUTO'))
+        with patch.object(carrier, 'CONNECTION', 'Network'), \
+             patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
+             patch.object(carrier, 'pending', return_value=['stage']), \
+             patch.object(carrier, 'execute', AsyncMock(side_effect=carrier.LocalNetworkDenied('x'))) as execute, \
+             patch.object(carrier, 'recover_all', AsyncMock()) as recover_all, \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(carrier.LocalNetworkDenied):
+                await carrier.execute_with_retry(args, {})
+            recover_all.assert_not_awaited()
+            self.assertEqual(execute.await_count, 1)
+
+    def stage(self, root, **journal):
+        folder = root / 'stage'; folder.mkdir()
+        carrier.write_tree_zip(folder / 'books.zip', {})
+        carrier.save_json(folder / 'books.json', {'hash': carrier.tree_hash({}), 'existed': True})
+        catalog = {'catalog': ('d', b'')}
+        carrier.write_tree_zip(folder / 'original.zip', catalog)
+        carrier.save_json(folder / 'journal.json', {'target': carrier.TARGET, 'udid_hash': carrier.digest(b'phone'),
+            'exported': 'airlift-saved-' + 'a' * 20, 'original_hash': carrier.tree_hash(catalog), **journal})
+        return folder
+
+    def offline_recovery(self, stack):
+        # A denied Local Network, an empty phone and mocked AFC: what recover_stage reaches is what it needs.
+        afc = AsyncMock(); afc.__aenter__.return_value = afc
+        stack.enter_context(patch.object(carrier, 'CONNECTION', 'Network'))
+        stack.enter_context(patch('pymobiledevice3.services.afc.AfcService', return_value=afc))
+        stack.enter_context(patch.object(carrier, 'exists', AsyncMock(return_value=False)))
+        stack.enter_context(patch.object(carrier, 'local_network_denied', return_value=True))
+        return (stack.enter_context(patch.object(carrier, 'restore_books', AsyncMock(return_value=[]))),
+                stack.enter_context(patch.object(carrier, 'transfer', AsyncMock())))
+
+    async def test_books_only_rollback_needs_no_local_network(self):
+        # Carrier stage finished with Books left; and an early stage whose catalog never left.
+        for journal in ({'complete': True, 'phase': 'placement-observed'}, {'complete': False, 'phase': 'staging'}):
+            with self.subTest(journal=journal), tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as stack:
+                root = pathlib.Path(temp)
+                folder = self.stage(root, **journal); (folder / 'original.zip').unlink()
+                books, transfer = self.offline_recovery(stack)
+                await carrier.recover_stage(SimpleNamespace(udid='phone'), folder, root)
+                books.assert_awaited_once()
+                transfer.assert_not_awaited()
+                self.assertEqual(carrier.read_json(folder / 'journal.json')['recovered_by'], str(root))
+
+    async def test_catalog_rollback_stops_on_denied_local_network(self):
+        with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as stack:
+            root = pathlib.Path(temp)
+            folder = self.stage(root, complete=False, phase='placement', requires_recovery=True)
+            books, transfer = self.offline_recovery(stack)
+            with self.assertRaises(carrier.LocalNetworkDenied):
+                await carrier.recover_stage(SimpleNamespace(udid='phone'), folder, root)
+            books.assert_awaited_once()
+            transfer.assert_not_awaited()
+            self.assertNotIn('recovered_by', carrier.read_json(folder / 'journal.json'))
+
+
 class VersionTest(unittest.TestCase):
     def test_cli_version_and_help_work_without_apple_services(self):
         for flag, expected in (('--version', f'CarrierSIM {VERSION}'), ('--help', '--recover')):
