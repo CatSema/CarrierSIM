@@ -1,14 +1,18 @@
 """AirTraffic protocol regressions; no Apple libraries or device required."""
 import io
+import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import carrier
+import airtraffic_apple as apple
 
 
 class FakeAppleHost:
-    def __init__(self, platform, assets=(), reject=False, missing=False, connect=True):
+    def __init__(self, platform, assets=(), reject=False, missing=False, connect=True, send_ok=True):
+        self.send_ok = send_ok
         self.platform = platform
         self.assets = assets
         self.reject = reject
@@ -59,9 +63,10 @@ class FakeAppleHost:
 
     def send_message(self, connection, message):
         self.events.append(('request', message))
-        self.messages += [{'name': name} for name in
-                          ('SyncAllowed', 'SyncFailed' if self.reject else 'ReadyForSync')]
-        return 1
+        if self.send_ok:
+            self.messages += [{'name': name} for name in
+                              ('SyncAllowed', 'SyncFailed' if self.reject else 'ReadyForSync')]
+        return self.send_ok
 
     def call(self, name, connection, *values):
         self.events.append((name, *values))
@@ -84,12 +89,12 @@ class AirTrafficTest(unittest.TestCase):
     ASSETS = [('source', 'first'), ('link', 'second'), ('saved', 'final')]
 
     def run_host(self, host, udid='phone', stdin=None):
-        with patch.object(carrier, 'AppleHost', return_value=host), \
+        with patch.object(apple, 'AppleHost', return_value=host), \
                 patch.object(carrier.sys, 'platform', host.platform), \
                 patch.object(carrier.sys, 'stdin', stdin or io.StringIO('CONTINUE\n')), \
-                patch.object(carrier.time, 'sleep'), patch('platform.mac_ver', return_value=('15.0', (), 'arm64')), \
+                patch.object(apple.time, 'sleep'), patch('platform.mac_ver', return_value=('15.0', (), 'arm64')), \
                 patch.object(carrier, 'framed') as frames:
-            carrier.native_host(udid, host.assets, [])
+            carrier.host_worker({'udid': udid, 'assets': host.assets, 'directories': []})
         return [call.args[0] for call in frames.call_args_list]
 
     def assert_closed(self, host):
@@ -143,6 +148,39 @@ class AirTrafficTest(unittest.TestCase):
         self.assertFalse(host.completed)
         self.assertFalse(any('MetadataSyncFinished' in event[0] for event in host.events))
         self.assert_closed(host)
+
+    def test_failed_send_reports_the_send_error_without_waiting_for_ready(self):
+        host = FakeAppleHost('win32', self.ASSETS, send_ok=False)
+        with self.assertRaisesRegex(RuntimeError, r'ATHostConnectionSendMessage\(RequestingSync\)'):
+            self.run_host(host)
+        self.assertEqual([event[1] for event in host.events if event[0] == 'read'],
+                         ['InstalledAssets', 'AssetMetrics', 'SyncAllowed'])
+        request = next(event[1] for event in host.events if event[0] == 'request')
+        self.assertIn(request, host.released)
+        self.assertFalse(host.completed)
+        self.assertFalse(any('MetadataSyncFinished' in event[0] for event in host.events))
+        self.assert_closed(host)
+
+    def test_apple_module_import_does_not_load_dlls_or_import_carrier(self):
+        code = """
+import ctypes
+import sys
+def unexpected_load(*args, **kwargs):
+    raise AssertionError('Library loaded during import')
+ctypes.CDLL = unexpected_load
+import airtraffic_apple
+assert 'carrier' not in sys.modules
+"""
+        result = subprocess.run([sys.executable, '-c', code], cwd=carrier.ROOT,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_linux_dispatch_does_not_enter_the_apple_transport(self):
+        with patch.object(carrier.sys, 'platform', 'linux'), \
+                patch.object(apple, 'run_worker') as worker:
+            with self.assertRaisesRegex(RuntimeError, 'macOS и Windows'):
+                carrier.host_worker({'udid': 'phone'})
+        worker.assert_not_called()
 
     def test_missing_manifest_asset_prevents_all_asset_completions(self):
         host = FakeAppleHost('win32', self.ASSETS, missing=True)

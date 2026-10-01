@@ -142,6 +142,16 @@ Windows с нестандартной установкой Apple — укажи�
 установленной версии:
 py carrier.py --check --apple-dir "C:\путь\Mobile Device Support" --apple-dir "C:\путь\Apple Application Support"
 
+Для iTunes из Microsoft Store путь к пакету покажет PowerShell:
+Get-AppxPackage AppleInc.iTunes | Select-Object -ExpandProperty InstallLocation
+Если загрузка из WindowsApps даёт WinError 5, скопируйте DLL из корня
+пакета, папку CoreFoundation.resources и DLL из AMDS64 в отдельную папку.
+Укажите её через --apple-dir при проверке и установке. Используйте файлы
+одной версии. Служба и драйвер Apple Mobile Device нужны для связи с iPhone.
+Вызовы Apple и обмен AirTraffic находятся в airtraffic_apple.py; при
+импорте модуля DLL не загружаются. carrier.py ведёт журнал и подтверждает
+резервную копию перед финальным переносом в отдельном процессе AirTraffic.
+
 Скрипт не скачивает пакеты или DLL; интернет нужен только для зависимостей.
 IMSI не выводится в консоль, но есть в копиях и журналах: не публикуйте runs.
 Папка runs уже исключена в .gitignore. Свою папку (--runs ПАПКА) внутри
