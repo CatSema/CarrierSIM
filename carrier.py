@@ -2512,7 +2512,7 @@ def main():
     parser.add_argument('--udid',metavar='ID',help='выбрать iPhone, если подключено несколько')
     parser.add_argument('--wifi',action='store_true',help='подключаться по Wi-Fi вместо кабеля (медленнее); нужны доверие и «Показывать iPhone при Wi-Fi», включённые заранее через кабель')
     parser.add_argument('--apple-dir',action='append',default=[],metavar='ПАПКА',help='Windows: папка DLL Apple; можно указать несколько раз')
-    parser.add_argument('--runs',type=Path,default=ROOT/'runs',metavar='ПАПКА',help='куда сохранять копии и журналы (по умолчанию runs рядом со скриптом)')
+    parser.add_argument('--runs',type=Path,default=ROOT/'runs',metavar='ПАПКА',help='куда сохранять копии и журналы (по умолчанию runs рядом со скриптом; свою папку внутри git-репозитория добавьте в .git/info/exclude)')
     parser._optionals.title='Параметры'
     args=parser.parse_args()
     print(f'CarrierSIM {VERSION}',flush=True)
