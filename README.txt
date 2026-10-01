@@ -279,8 +279,14 @@ USB. Скачайте «Apple Mobile Device USB Driver» из Microsoft Update C
 
 «iPhone не принял компоненты Apple на этом компьютере» (раньше: «Сбой
 AirTraffic: Синхронизация закончилась преждевременно»), в журнале iPhone
-«Grappa session could not be established». Встречалось на Windows, повтор
-не поможет. Удалите iTunes (и версию из Microsoft Store),
+«Grappa session could not be established». iPhone отклонил обмен AirTraffic.
+На Windows ATHostConnectionSendSyncRequest мог приводить к этому сбою ещё
+при сохранении исходного каталога. Теперь скрипт создаёт соединение через
+ATHostConnectionCreateWithLibrary и отправляет RequestingSync с готовыми
+данными Grappa. Успешный обмен AirTraffic сам по себе не подтверждает
+работу VoWiFi, EVS или 5G.
+
+Если ошибка осталась, повтор не поможет. Удалите iTunes (и версию из Microsoft Store),
 поставьте полный iTunes x64 с https://support.apple.com/en-us/106372 (не
 только AppleMobileDeviceSupport64.msi из него), запустите его один раз и
 повторите. В одном случае помогла только версия 12.11.0.26, и перед этим
@@ -520,5 +526,9 @@ SHA256 5f8166b3e33d14230273b85320795f1eb1f29214d2c0594056d0b0e448c029f1
 iPhone 18 Pro: https://www.apple.com/iphone-18-pro/specs/
 Протокол переноса основан на AirLift (0xjohnnydev/airlift, c75b3ea),
 лицензия MIT приложена (LICENSE-AirLift.txt).
+Обмен Grappa на Windows адаптирован из dhava-gautama/AirCard-Windows,
+src/airtraffic.rs, коммит e0eadb0c88da55516f1c9f939fd4ce27560910d5;
+лицензия MIT приложена (LICENSE-AirCard.txt). Готовые данные Grappa в этом
+коде взяты из yinyajiang/go-tunes.
 
 Исследование, разработка и тесты — Vladimir B / vlw (vlwwwwww@gmail.com).

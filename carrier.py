@@ -763,6 +763,17 @@ from datetime import datetime
 APPLE_DIRS = []
 ASSET_SHA256 = '6de1ea0be81a29c145ef414f24bc21d1dcb8a4eb737b22b1f956e9a6f0c2098b'
 
+# Windows handshake adapted from dhava-gautama/AirCard-Windows (MIT),
+# src/airtraffic.rs at e0eadb0c88da55516f1c9f939fd4ce27560910d5.
+# Public replayable host blob from yinyajiang/go-tunes, not device credentials.
+# Windows SendSyncRequest generated an invalid Grappa in the verified setup.
+# See LICENSE-AirCard.txt for the adaptation's license.
+WINDOWS_LIBRARY_ID = '12.6.0.100'
+WINDOWS_HOST_GRAPPA = bytes.fromhex(
+    '0101111111111111111111111111111111110440bc2785e0dbf166361e07980a'
+    '5ea48dba95b3b8ea265d62aefea51bb7b190e0b77126290ad39bb13fecc08c25'
+    'a9561c517ac11e64905da029e61bdfd0ba22c313')
+
 class AppleHost:
     def __init__(self, directories=()):
         self.handles = []
@@ -814,6 +825,14 @@ class AppleHost:
             ('ATHostConnectionSendAssetCompleted', None, [P,P,P,P]),
             ('ATCFMessageGetName', P, [P]), ('ATCFMessageGetParam', P, [P,P])]:
             bind(self.at, name, result, args)
+        if sys.platform == 'win32':
+            for name, result, args in [
+                ('ATHostConnectionCreateWithLibrary', P, [P,P,U]),
+                ('ATHostConnectionGetCurrentSessionNumber', C.c_uint32, [P]),
+                ('ATCFMessageCreate', P, [C.c_uint32,P,P]),
+                ('ATHostConnectionSendMessage', C.c_int32, [P,P]),
+                ('ATHostConnectionSendPowerAssertion', C.c_int32, [P,P])]:
+                bind(self.at, name, result, args)
 
     def encode(self, value):
         raw = plistlib.dumps(value, fmt=plistlib.FMT_BINARY)
@@ -886,7 +905,13 @@ def native_host(udid, assets, directories):
         if udid is None:
             framed({'ok': True, 'deviceConnections': 0}); return
         ref = host.encode(udid)
-        try: connection = host.at.ATHostConnectionCreate(ref)
+        try:
+            if sys.platform == 'win32':
+                library = host.encode(WINDOWS_LIBRARY_ID)
+                try: connection = host.at.ATHostConnectionCreateWithLibrary(library, ref, 0)
+                finally: host.cf.CFRelease(library)
+            else:
+                connection = host.at.ATHostConnectionCreate(ref)
         finally: host.cf.CFRelease(ref)
         require(connection, 'Не удалось открыть AirTraffic. Закройте синхронизацию iTunes/Finder.')
         def until(wanted, limit):
@@ -906,18 +931,44 @@ def native_host(udid, assets, directories):
                     require(name not in ('SyncFailed','SyncFinished'), 'Синхронизация закончилась преждевременно')
                 finally: host.cf.CFRelease(msg)
             raise RuntimeError('Не получено сообщение ' + wanted)
-        until('SyncAllowed', 8)
         info = {'Type':'iTunes', 'Version':'13.7.0.161', 'SyncHostName':'CarrierSIM',
                 'LibraryID':str(uuid.uuid4()), 'SyncedDataclasses':['Book'],
                 'SyncedAssetTypes':['Book'], 'Wakeable':False}
         if sys.platform == 'darwin':
             import platform
             info['MacOSVersion'] = platform.mac_ver()[0]
-        host.call('ATHostConnectionSendHostInfo', connection, info)
-        time.sleep(.2)
-        host.call('ATHostConnectionSendSyncRequest', connection, ['Book'], {}, info)
+        if sys.platform == 'win32':
+            info = {'LibraryID': WINDOWS_LIBRARY_ID, 'Version': WINDOWS_LIBRARY_ID,
+                    'SyncHostName': 'CarrierSIM', 'SyncedDataclasses': ['Book']}
+            host.call('ATHostConnectionSendHostInfo', connection, info)
+            until('SyncAllowed', 20)
+            session = host.at.ATHostConnectionGetCurrentSessionNumber(connection)
+            params = {'Dataclasses': ['Book'], 'DataclassAnchors': {'Book': '0'},
+                      'HostInfo': {**info, 'Grappa': WINDOWS_HOST_GRAPPA}}
+            command = host.encode('RequestingSync')
+            try:
+                value = host.encode(params)
+                try: message = host.at.ATCFMessageCreate(session, command, value)
+                finally: host.cf.CFRelease(value)
+            finally: host.cf.CFRelease(command)
+            require(message, 'ATCFMessageCreate(RequestingSync) failed')
+            try:
+                status = host.at.ATHostConnectionSendMessage(connection, message)
+                framed({'event': 'requesting-sync', 'status': status})
+            finally: host.cf.CFRelease(message)
+        else:
+            until('SyncAllowed', 8)
+            host.call('ATHostConnectionSendHostInfo', connection, info)
+            time.sleep(.2)
+            host.call('ATHostConnectionSendSyncRequest', connection, ['Book'], {}, info)
         until('ReadyForSync', 12)
-        host.call('ATHostConnectionSendMetadataSyncFinished', connection, {'Book':1}, {})
+        # Empty assets allow a handshake probe without staging files or syncing metadata.
+        if not assets:
+            framed({'ok': True, 'probe': True}); return
+        anchors = {'Book': '0'} if sys.platform == 'win32' else {}
+        if sys.platform == 'win32':
+            host.call('ATHostConnectionSendPowerAssertion', connection, True)
+        host.call('ATHostConnectionSendMetadataSyncFinished', connection, {'Book':1}, anchors)
         manifest = until('AssetManifest', 20)
         require(isinstance(manifest,dict), 'Неверный манифест AirTraffic')
         books = [r for r in manifest.get('Book',[]) if isinstance(r,dict)]
