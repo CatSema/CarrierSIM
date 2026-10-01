@@ -660,6 +660,10 @@ class OutcomeTest(unittest.TestCase):
 
 
 class LocalNetworkTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        patcher = patch.object(carrier, 'LOCAL_NETWORK_WAIT', 0)
+        patcher.start(); self.addCleanup(patcher.stop)
+
     def test_sockaddr_ipv6_and_ipv4(self):
         import socket
         ipv6 = bytes([28, socket.AF_INET6, 0xf2, 0x7e]) + bytes(4) + \
@@ -721,8 +725,10 @@ class LocalNetworkTest(unittest.IsolatedAsyncioTestCase):
                                attempts=2, runs=pathlib.Path('.'), status=False, recover=False)
         with patch.object(carrier, 'CONNECTION', 'Network'), \
              patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
+             patch.object(carrier, 'pending', return_value=[]), \
              patch.object(carrier, 'local_network_denied', return_value=True), \
-             patch.object(carrier, 'execute', AsyncMock()) as execute:
+             patch.object(carrier, 'execute', AsyncMock()) as execute, \
+             contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, 'Локальная сеть'):
                 await carrier.execute_with_retry(args, {})
             execute.assert_not_awaited()
@@ -732,6 +738,28 @@ class LocalNetworkTest(unittest.IsolatedAsyncioTestCase):
              patch.object(carrier, 'local_network_denied', return_value=True) as check, \
              patch.object(carrier, 'execute', AsyncMock(return_value=0)):
             self.assertEqual(await carrier.execute_with_retry(args, {}), 0)
+            check.assert_not_called()
+
+    async def test_allowing_in_the_alert_lets_the_install_go_on(self):
+        # The first probe is refused while macOS shows its alert; the next one, after "Allow", passes.
+        with patch.object(carrier, 'CONNECTION', 'Network'), patch.object(carrier, 'LOCAL_NETWORK_WAIT', 3), \
+             patch.object(carrier, 'local_network_denied', side_effect=[True, True, False]) as check, \
+             patch.object(carrier.asyncio, 'sleep', AsyncMock()), contextlib.redirect_stdout(io.StringIO()) as out:
+            await carrier.require_local_network('phone')
+        self.assertEqual(check.call_count, 3)
+        self.assertIn('Разрешить', out.getvalue())
+
+    async def test_unfinished_stage_is_reported_before_the_permission(self):
+        args = SimpleNamespace(udid=None, wait_seconds=1, diagnose=False, watch_call=False, report=False,
+                               attempts=1, runs=pathlib.Path('.'), status=False, recover=False)
+        with patch.object(carrier, 'CONNECTION', 'Network'), \
+             patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
+             patch.object(carrier, 'pending', return_value=['stage']), \
+             patch.object(carrier, 'local_network_denied', return_value=True) as check, \
+             patch.object(carrier, 'execute', AsyncMock(side_effect=RuntimeError('Прошлая операция не завершилась'))), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'Прошлая операция'):
+                await carrier.execute_with_retry(args, {})
             check.assert_not_called()
 
     async def test_recover_over_wifi_skips_the_early_check(self):

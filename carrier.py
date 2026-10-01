@@ -914,10 +914,20 @@ class LocalNetworkDenied(RuntimeError):
     pass
 
 
+# macOS may refuse at once while its Local Network alert is still on screen, and may not show the
+# alert at all to a process that exits right after the refusal (TN3179): ask again for this long.
+LOCAL_NETWORK_WAIT = 20
+
+
 async def require_local_network(udid):
     # Only AirTraffic needs it: installs, and rollbacks that write the catalog back. Books goes through AFC.
-    if CONNECTION=='Network' and await asyncio.to_thread(local_network_denied,udid):
-        raise LocalNetworkDenied(LOCAL_NETWORK_HINT)
+    if CONNECTION!='Network' or not await asyncio.to_thread(local_network_denied,udid): return
+    print(f'Похоже, macOS не пускает терминал в локальную сеть. Если появилось окно «Локальная сеть», '
+          f'нажмите «Разрешить». Жду до {LOCAL_NETWORK_WAIT} с…',flush=True)
+    for _ in range(LOCAL_NETWORK_WAIT):
+        await asyncio.sleep(1)
+        if not await asyncio.to_thread(local_network_denied,udid): return
+    raise LocalNetworkDenied(LOCAL_NETWORK_HINT)
 
 
 # macOS refuses a denied connect in about 1 ms; a real "no route" takes neighbor discovery's seconds.
@@ -1359,9 +1369,10 @@ async def execute_with_retry(args,assets):
     if args.diagnose or args.watch_call or args.report:
         # Read-only: no retries and no auto-recovery, which would write to the phone.
         return await diagnostics(args)
-    if not args.status and not args.recover:
-        # Before any stage: an install needs AirTraffic. A rollback checks only before its AirTraffic
-        # step (recover_stage): stages with only Books left go through AFC and need no direct connection.
+    # Before any stage: an install needs AirTraffic. A rollback checks only before its AirTraffic
+    # step (recover_stage): stages with only Books left go through AFC and need no direct connection.
+    # An unfinished stage stops the install anyway (execute): say that first, not the permission.
+    if CONNECTION=='Network' and not args.status and not args.recover and not pending(args.runs,args.udid):
         await require_local_network(args.udid)
     for attempt in range(1,args.attempts+1):
         print(f'Попытка {attempt} из {args.attempts}',flush=True)
