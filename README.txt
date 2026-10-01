@@ -1,6 +1,6 @@
 CarrierSIM — Vodafone HU (или другой пакет оператора) для SIM iPhone
 
-Python-скрипт для macOS и Windows. Каждой выбранной SIM по полному IMSI
+Python-скрипт для macOS, Windows и Linux. Каждой выбранной SIM по полному IMSI
 назначается системный пакет оператора: по умолчанию Vodafone_hu, для МТС
 России Vodafone_ro (bundle.yaml). Без флагов выбраны все SIM России и
 Беларуси, которые сообщил iPhone; зарубежная SIM меняется, только если её
@@ -23,6 +23,7 @@ IMSI, операция останавливается до записи.
    с сайта Apple. Apple Devices и iTunes из Microsoft Store автоматически
    не находятся (папки библиотек можно указать через --apple-dir).
    macOS: используются системные библиотеки, ставить ничего не нужно.
+   Linux: нужен системный usbmuxd; библиотека Apple AirTrafficHost не нужна.
 4. Подключите iPhone кабелем, включите нужные линии, разблокируйте,
    подтвердите доверие компьютеру. Завершите синхронизацию Finder/iTunes.
    Кабель нужен для первого доверия; дальше можно по Wi-Fi (см. БЕЗ КАБЕЛЯ).
@@ -39,9 +40,10 @@ CarrierSIM (CarrierSIM.exe). macOS: сборка не подписана Apple, 
 Сборка macOS arm64 проверена без телефона; Windows и Intel Mac на железе не
 запускались.
 
-БЫСТРЫЙ ЗАПУСК ДВОЙНЫМ ЩЕЛЧКОМ
+БЫСТРЫЙ ЗАПУСК
 macOS: Запуск macOS.command
 Windows: Запуск Windows.cmd
+Linux: bash "Запуск Linux.sh"
 Откроется меню:
   1  Установить профиль по bundle.yaml (МТС России — Vodafone_ro, остальные — Vodafone_hu)
   2  Посмотреть SIM и план установки, без записи
@@ -62,12 +64,14 @@ Windows: Запуск Windows.cmd
 (нужен интернет). Системный Python не изменяется. Какой Python взять:
 на macOS лаунчер предпочитает 3.12 или 3.11; на Windows — тот, что запускает
 команда py, затем python, затем установки в стандартных папках.
-Нужен 3.11 или новее, x64. На Python 3.13+ вместо библиотек
+На Linux — сначала 3.12 или 3.11, затем другие доступные версии python3.
+Нужен 3.11 или новее (на Windows — x64). На Python 3.13+ вместо библиотек
 pylzss и lzfse ставятся пустые заглушки: готовых сборок для этих версий у них
 нет, а скрипту они не нужны. Компилятор C++ не требуется.
 
 Лаунчеры принимают те же флаги, что и carrier.py, например
-"Запуск Windows.cmd" --status или ./"Запуск macOS.command" --check.
+"Запуск Windows.cmd" --status, ./"Запуск macOS.command" --check или
+bash "Запуск Linux.sh" --check.
 С флагами выполняется одна команда без меню.
 
 КАК ПОДКЛЮЧИТЬ VoWiFi
@@ -347,9 +351,10 @@ iOS: «подпись принята», «iOS выбрала X вместо Y»,
 - installation_proxy — установка IPCC;
 - syslog_relay — системный журнал, из него читаются сообщения CommCenter;
 - streaming_zip_conduit — загрузка ZIP с распаковкой в /var/mobile/Media;
-- com.apple.atc (AirTraffic) — синхронизация iTunes/Finder; вызывается через
-  закрытую библиотеку Apple AirTrafficHost (на macOS системная, на Windows
-  ставится с iTunes, для Linux её нет — поэтому Linux не поддерживается).
+- com.apple.atc (AirTraffic) — синхронизация iTunes/Finder; на macOS и Windows
+  вызывается через библиотеку Apple AirTrafficHost, на Linux — через
+  pymobiledevice3. Протокол Linux backend основан на MIT-проектах AirCard-Linux:
+  https://github.com/shinkuan/AirCard-Linux и https://github.com/hoicau/AirCard-Linux.
 
 Шаги установки:
 1. Через installation_proxy ставится подписанный IPCC-триггер оператора,
@@ -493,6 +498,28 @@ Android. То же пишут про операторов на сети T2, на
 Т-Мобайл.
 
 ПРОВЕРЕНО
+На Linux по USB проверен полный цикл установки на iPhone 14, 14 Pro, 15 Pro,
+15 Pro Max, 17 и 17 Pro с iOS 18.7.7 и 26.x. На iPhone 14 Pro также проверен
+возврат штатных профилей обеих SIM и установка только для SIM 1. Команда
+bash "Запуск Linux.sh" --atc-probe проверяет начало AirTraffic-сеанса без
+передачи файлов. На iPhone 15 Pro / iOS 27.0.1 (24A446), МТС, по USB
+проверены восстановление после сбоя (пункт 5) и последующий возврат штатного
+профиля (пункт 4): статус подтвердил MTS_ru, служебные файлы Books
+восстановлены. Wi-Fi на Linux отдельно не проверен.
+
+Проверенные сочетания при установке по USB:
+
+| iPhone | iOS (сборка) | SIM → пакет |
+| --- | --- | --- |
+| 14 | 26.3 (23D127) | МТС → Vodafone_ro |
+| 14 Pro | 26.3.1 (23D8133) | Yota и T2 → Vodafone_hu |
+| 15 Pro | 18.7.7 (22H340) | Билайн → Vodafone_hu |
+| 15 Pro Max | 26.6.1 (23G83) | Билайн → Vodafone_hu |
+| 17 | 26.6.1 (23G83) | МТС → Vodafone_ro |
+| 17 Pro | 26.6.2 (23G90) | МТС eSIM → Vodafone_ro |
+
+На iPhone 17 также подтверждён звонок по VoWiFi. Эти проверки выполнены на Linux.
+
 Полный цикл на iPhone 17 / iOS 27.0 (24A437): обе SIM выбрали Vodafone_hu,
 подписи приняты. Установка по Wi-Fi (--wifi) — на iPhone 16 Pro Max /
 iOS 27.0.1 (24A446), macOS. Загрузка AirTrafficHost/CoreFoundation — на macOS

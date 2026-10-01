@@ -17,11 +17,123 @@ import launch
 from carriersim_version import VERSION
 
 
+class LinuxBackendTest(unittest.TestCase):
+    def test_dispatcher_keeps_apple_backend_on_macos_and_windows(self):
+        self.assertEqual(carrier.host_backend('darwin'), 'apple')
+        self.assertEqual(carrier.host_backend('win32'), 'apple')
+        self.assertEqual(carrier.host_backend('linux'), 'linux-native-atc')
+        with self.assertRaises(RuntimeError):
+            carrier.host_backend('freebsd')
+
+    def test_apple_worker_rejects_linux_probe(self):
+        with patch.object(carrier, 'host_backend', return_value='apple'), \
+             patch.object(carrier, 'native_host') as apple:
+            with self.assertRaisesRegex(RuntimeError, 'только на Linux'):
+                carrier.host_worker({'probe': True})
+            apple.assert_not_called()
+
+    def test_distribution_description_falls_back_without_os_release(self):
+        with patch('platform.freedesktop_os_release', return_value={'PRETTY_NAME': 'ALT Regular'}), \
+             patch('platform.platform', return_value='Linux-6.18'), \
+             patch('platform.machine', return_value='x86_64'):
+            self.assertEqual(carrier.linux_platform_description(), 'ALT Regular · Linux-6.18 · x86_64')
+        with patch('platform.freedesktop_os_release', side_effect=OSError), \
+             patch('platform.platform', return_value='Linux-6.18'), \
+             patch('platform.machine', return_value='x86_64'):
+            self.assertEqual(carrier.linux_platform_description(), 'Linux-6.18 · x86_64')
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux-only usbmuxd paths')
+    def test_usbmuxd_detects_sbin_without_path(self):
+        with patch('shutil.which', return_value=None), \
+             patch.object(carrier.Path, 'is_file', return_value=True), \
+             patch.object(carrier.os, 'access', return_value=True), \
+             patch.object(carrier.Path, 'stat', side_effect=OSError):
+            self.assertIn('/usr/sbin/usbmuxd', carrier.linux_usbmuxd_status())
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux-only usbmuxd paths')
+    def test_linux_usbmuxd_reports_missing(self):
+        with patch('shutil.which', return_value=None), \
+             patch.object(carrier.Path, 'is_file', return_value=False), \
+             patch.object(carrier.Path, 'stat', side_effect=OSError):
+            self.assertEqual(carrier.linux_usbmuxd_status(), 'не найден')
+
+
+class CheckedPhoneTest(unittest.TestCase):
+    def test_verified_linux_usb_combinations_do_not_warn(self):
+        for product, board, version, build in (
+            ('iPhone16,2', 'D84AP', '26.6.1', '23G83'),
+            ('iPhone14,7', 'D27AP', '26.3', '23D127'),
+            ('iPhone18,3', 'V57AP', '26.6.1', '23G83'),
+            ('iPhone18,1', 'V53AP', '26.6.2', '23G90'),
+            ('iPhone16,1', 'D83AP', '18.7.7', '22H340'),
+            ('iPhone15,2', 'D73AP', '26.3.1', '23D8133'),
+        ):
+            info = {'ProductType': product, 'HardwareModel': board,
+                    'ProductVersion': version, 'BuildVersion': build,
+                    'ActivationState': 'Activated'}
+            output = io.StringIO()
+            with patch.object(carrier.sys, 'platform', 'linux'), contextlib.redirect_stdout(output):
+                carrier.check_phone(info)
+            self.assertEqual(output.getvalue(), '')
+
+
+class HostSessionTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.run = pathlib.Path(self.temp.name)
+
+    async def test_callback_authorizes_final_asset_and_connection_is_saved(self):
+        child = (
+            "import json,sys,pathlib; "
+            "config=json.loads(pathlib.Path(sys.argv[1]).read_text()); "
+            "print('CARRIER_SWAP_JSON:'+json.dumps({'event':'before-final-asset'}),flush=True); "
+            "line=sys.stdin.readline().strip(); "
+            "print('CARRIER_SWAP_JSON:'+json.dumps({'ok':line=='CONTINUE','connection':config['connection']}),flush=True)"
+        )
+        calls = []
+        async def callback():
+            calls.append('backup')
+            self.assertTrue((self.run/'host-input.json').exists())
+        with patch.object(carrier, 'host_command', return_value=[sys.executable, '-c', child]), \
+             patch.object(carrier, 'CONNECTION', 'Network'):
+            await carrier.host_session('device', [('a', 'b')], callback, self.run)
+        self.assertEqual(calls, ['backup'])
+        self.assertFalse((self.run/'host-input.json').exists())
+        log = (self.run/'host.jsonl').read_text()
+        self.assertIn('"connection": "Network"', log)
+
+    async def test_failed_callback_never_authorizes(self):
+        child = (
+            "import json,sys; "
+            "print('CARRIER_SWAP_JSON:'+json.dumps({'event':'before-final-asset'}),flush=True); "
+            "line=sys.stdin.readline(); "
+            "print('CARRIER_SWAP_JSON:'+json.dumps({'ok':False,'line':line}),flush=True)"
+        )
+        async def callback():
+            raise RuntimeError('backup failed')
+        with patch.object(carrier, 'host_command', return_value=[sys.executable, '-c', child]):
+            with self.assertRaisesRegex(RuntimeError, 'backup failed'):
+                await carrier.host_session('device', [('a', 'b')], callback, self.run)
+        self.assertFalse((self.run/'host-input.json').exists())
+
+
 class FilesTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = pathlib.Path(self.temp.name)
+
+    def test_run_details_reads_linux_manifest_counts(self):
+        stage = self.root / 'restore'
+        stage.mkdir()
+        carrier.save_json(stage / 'journal.json', {'phase': 'final-authorized', 'complete': False})
+        (stage / 'host.jsonl').write_text(
+            'CARRIER_SWAP_JSON:' + json.dumps({'event': 'manifest', 'expected': 3, 'matched': 3}) + '\n'
+            'CARRIER_SWAP_JSON:' + json.dumps({'ok': False, 'error': 'sync failed'}) + '\n', encoding='utf-8')
+        rows = carrier.run_details(self.root)
+        self.assertIn(('  Ответ AirTraffic', 'ожидалось 3, найдено 3, повторяется 0'), rows)
+        self.assertIn(('  Ошибка AirTraffic', 'sync failed'), rows)
 
     def test_backup_roundtrip_preserves_files_directories_and_links(self):
         tree = {'bundle': ('d', b''), 'bundle/data': ('f', b'\x00\xff'),

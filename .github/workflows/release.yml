@@ -65,12 +65,12 @@ jobs:
       - name: Attest archive provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-path: dist/CarrierSIM-${{ github.ref_name }}-macOS-Windows.zip
+          subject-path: dist/CarrierSIM-${{ github.ref_name }}-macOS-Windows-Linux.zip
 
       - name: Upload archive to a draft release
         run: |
           set -euo pipefail
-          asset="dist/CarrierSIM-${RELEASE_TAG}-macOS-Windows.zip"
+          asset="dist/CarrierSIM-${RELEASE_TAG}-macOS-Windows-Linux.zip"
           if gh release view "$RELEASE_TAG" --json isDraft > release.json; then
             python3 -c 'import json; assert json.load(open("release.json"))["isDraft"], "Refusing to modify a published release"'
             gh release upload "$RELEASE_TAG" "$asset" --clobber
@@ -81,7 +81,7 @@ jobs:
       - name: Verify uploaded archive and draft status
         run: |
           set -euo pipefail
-          gh release download "$RELEASE_TAG" --pattern "CarrierSIM-${RELEASE_TAG}-macOS-Windows.zip" --dir downloaded
-          cmp "dist/CarrierSIM-${RELEASE_TAG}-macOS-Windows.zip" "downloaded/CarrierSIM-${RELEASE_TAG}-macOS-Windows.zip"
+          gh release download "$RELEASE_TAG" --pattern "CarrierSIM-${RELEASE_TAG}-macOS-Windows-Linux.zip" --dir downloaded
+          cmp "dist/CarrierSIM-${RELEASE_TAG}-macOS-Windows-Linux.zip" "downloaded/CarrierSIM-${RELEASE_TAG}-macOS-Windows-Linux.zip"
           gh release view "$RELEASE_TAG" --json isDraft > release.json
           python3 -c 'import json; assert json.load(open("release.json"))["isDraft"], "Release must remain a draft"'

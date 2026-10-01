@@ -51,7 +51,19 @@ jobs:
           python -m pip check
           python tests/check_dependencies.py
       - name: Compile Python sources
-        run: python -m compileall -q carrier.py launch.py carriersim_version.py tests .github/scripts
+        run: python -m compileall -q carrier.py airtraffic_native.py launch.py carriersim_version.py tests .github/scripts
+      - name: Check Linux AirTraffic backend without a phone
+        if: runner.os == 'Linux'
+        run: |
+          python - <<'PY'
+          import json, subprocess, sys
+          check = subprocess.run([sys.executable, 'carrier.py', '--_host', 'check'],
+              input='{"directories":[],"connection":"USB"}\n', text=True, capture_output=True)
+          rows = [json.loads(line.split(':', 1)[1]) for line in check.stdout.splitlines()
+                  if line.startswith('CARRIER_SWAP_JSON:')]
+          assert check.returncode == 0 and rows[-1] == {
+              'ok': True, 'backend': 'linux-native-atc', 'deviceConnections': 0}, check.stderr
+          PY
       - name: Run regression tests without a phone
         run: python -m unittest discover -s tests -v
 

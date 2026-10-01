@@ -942,6 +942,25 @@ def native_host(udid, assets, directories):
         host.close()
 
 
+def host_backend(platform_name=None):
+    platform_name = platform_name or sys.platform
+    if platform_name in ('darwin', 'win32'):
+        return 'apple'
+    if platform_name.startswith('linux'):
+        return 'linux-native-atc'
+    raise RuntimeError('Поддерживаются macOS, Windows и Linux.')
+
+
+def host_worker(config):
+    if host_backend() == 'apple':
+        if config.get('probe'):
+            raise RuntimeError('--atc-probe доступен только на Linux')
+        return native_host(config.get('udid'), config.get('assets', []), config.get('directories', []))
+    from airtraffic_native import run_worker
+    return asyncio.run(run_worker(config.get('udid'), config.get('assets', []),
+                                  config.get('connection', 'USB'), framed, config.get('probe', False)))
+
+
 LOCAL_NETWORK_HINT = ('Похоже, macOS не пускает этот терминал в локальную сеть: iPhone по Wi-Fi отклонил '
     'соединение мгновенно, а AirTraffic соединяется с ним напрямую. Разрешите терминалу доступ: «Системные настройки → Конфиденциальность и безопасность → '
     'Локальная сеть». Из tmux, screen или SSH macOS разрешения не спрашивает: запустите «Запуск macOS.command» '
@@ -1033,7 +1052,7 @@ def host_command():
 
 async def host_session(udid, assets, callback, run):
     config = run/'host-input.json'
-    save_json(config, {'udid':udid, 'assets':assets, 'directories':APPLE_DIRS})
+    save_json(config, {'udid':udid, 'assets':assets, 'directories':APPLE_DIRS, 'connection':CONNECTION})
     proc = await asyncio.create_subprocess_exec(*host_command(), str(config),
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     async def stderr():
@@ -1310,9 +1329,19 @@ def remove_imsi_links(original, only=None):
 
 def check_phone(info):
     model = MODELS.get(info['ProductType'])
+    checked_linux = (
+        (info['ProductType'], str(info['HardwareModel']).upper(), info['ProductVersion'], info['BuildVersion'])
+        in (('iPhone16,2', 'D84AP', '26.6.1', '23G83'),
+            ('iPhone14,7', 'D27AP', '26.3', '23D127'),
+            ('iPhone18,3', 'V57AP', '26.6.1', '23G83'),
+            ('iPhone18,1', 'V53AP', '26.6.2', '23G90'),
+            ('iPhone16,1', 'D83AP', '18.7.7', '22H340'),
+            ('iPhone15,2', 'D73AP', '26.3.1', '23D8133'))
+        and sys.platform.startswith('linux')
+    )
     if (not model or str(info['HardwareModel']).upper() not in model['boards']
-            or info['ProductVersion'] != '27.0'
-            or info['BuildVersion'] not in ('24A435', '24A437')):
+            or not (checked_linux or
+                    (info['ProductVersion'] == '27.0' and info['BuildVersion'] in ('24A435', '24A437')))):
         print('Предупреждение: модель, плата или версия iOS не проверена. '
               'Скрипт МОЖЕТ не работать. Продолжаю без ограничения совместимости.', flush=True)
     require(info['ActivationState']=='Activated','iPhone не активирован.')
@@ -2214,6 +2243,35 @@ def sysctl(name):
         return None
 
 
+def linux_usbmuxd_status():
+    """Find the daemon without requiring sbin in the user's PATH."""
+    import shutil
+    executable = shutil.which('usbmuxd')
+    if not executable:
+        executable = next((str(path) for path in (Path('/usr/sbin/usbmuxd'), Path('/sbin/usbmuxd'),
+                                                 Path('/usr/bin/usbmuxd'), Path('/bin/usbmuxd'))
+                           if path.is_file() and os.access(path, os.X_OK)), None)
+    try:
+        socket_exists = stat.S_ISSOCK(Path('/run/usbmuxd').stat().st_mode)
+    except OSError:
+        socket_exists = False
+    if executable:
+        return f'установлен ({executable}); сокет {"есть" if socket_exists else "не обнаружен"}'
+    if socket_exists:
+        return 'сокет /run/usbmuxd есть; исполняемый файл не найден'
+    return 'не найден'
+
+
+def linux_platform_description():
+    import platform
+    try:
+        distro = platform.freedesktop_os_release().get('PRETTY_NAME', '').strip()
+    except OSError:
+        distro = ''
+    details = f'{platform.platform()} · {platform.machine()}'
+    return f'{distro} · {details}' if distro else details
+
+
 def environment_info():
     import platform
     from importlib.metadata import version, metadata, PackageNotFoundError
@@ -2260,6 +2318,11 @@ def environment_info():
                 rows.append(('Apple Mobile Device Service', 'установлена'))
         except Exception:
             rows.append(('Apple Mobile Device Service', 'не найдена'))
+    elif sys.platform.startswith('linux'):
+        rows.append(('Linux', linux_platform_description()))
+        rows.append(('AirTraffic', 'native com.apple.atc через pymobiledevice3'))
+        rows.append(('usbmuxd', linux_usbmuxd_status()))
+        rows.append(('Транспорт', 'usbmuxd / lockdownd'))
     else:
         rows.append(('ОС', platform.platform()))
     return rows
@@ -2319,6 +2382,11 @@ def run_details(run):
                 try: row = json.loads(raw.split(':', 1)[1])
                 except ValueError: continue
                 if row.get('event') == 'manifest':
+                    if type(row.get('expected')) is int:
+                        rows.append(('  Ответ AirTraffic',
+                                     f"ожидалось {row['expected']}, найдено {row.get('matched')}, "
+                                     f"повторяется {row.get('duplicate', 0)}"))
+                        continue
                     book = row.get('book', [])
                     expected = set(row.get('expected', []))
                     rows.append(('  Ответ AirTraffic', f"типы {row.get('dataclasses')}, объектов Book {len(book)}, "
@@ -2432,7 +2500,7 @@ def main():
     if len(sys.argv)>1 and sys.argv[1]=='--_host':
         try:
             value=json.loads(sys.stdin.readline()) if sys.argv[2]=='check' else read_json(Path(sys.argv[2]))
-            native_host(value.get('udid'),value.get('assets',[]),value.get('directories',[]))
+            host_worker(value)
             return 0
         except Exception as e:framed({'ok':False,'error':error_text(e)});return 1
     parser=argparse.ArgumentParser(description='Профиль из bundle.yaml для SIM России и Беларуси; зарубежные — только по явному выбору. '
@@ -2441,7 +2509,8 @@ def main():
     parser.add_argument('--version', action='version', version=f'CarrierSIM {VERSION}')
     parser.add_argument('-h','--help',action='help',help='показать эту справку')
     group=parser.add_mutually_exclusive_group()
-    group.add_argument('--check',action='store_true',help='проверить файлы и библиотеки Apple, без подключения к телефону')
+    group.add_argument('--check',action='store_true',help='проверить файлы и AirTraffic backend, без подключения к телефону')
+    group.add_argument('--atc-probe',action='store_true',help=argparse.SUPPRESS)
     group.add_argument('--status',action='store_true',help='показать найденные SIM и план, ничего не записывать')
     group.add_argument('--restore',action='store_true',help='удалить ссылки по IMSI и включить штатный выбор профилей; с --sims 1 или 2 только для этой SIM')
     group.add_argument('--restore-backup',type=Path,metavar='КАТАЛОГ',help='дополнительно: вернуть каталог из конкретной резервной копии')
@@ -2493,18 +2562,32 @@ def main():
     global APPLE_DIRS, CONNECTION
     if args.wifi: CONNECTION='Network'
     APPLE_DIRS=[str(Path(p).resolve()) for p in args.apple_dir]
+    if sys.platform.startswith('linux'):
+        require(linux_usbmuxd_status() != 'не найден',
+                'usbmuxd не найден. Установите системный usbmuxd и запустите службу '
+                '(например, Debian/Ubuntu: sudo apt install usbmuxd), затем повторите --check.')
     # No shell, no compiler, no native executable bundled with the archive.
-    check=subprocess.run(host_command()+['check'],input=json.dumps({'directories':APPLE_DIRS}),
+    check=subprocess.run(host_command()+['check'],input=json.dumps({'directories':APPLE_DIRS,'connection':CONNECTION}),
                          capture_output=True,text=True,encoding='utf-8',timeout=20)
     frames=[json.loads(l.split(':',1)[1]) for l in check.stdout.splitlines() if l.startswith('CARRIER_SWAP_JSON:')]
     require(check.returncode==0 and frames and frames[-1].get('ok'),
-            'Библиотеки Apple недоступны: '+str(frames[-1].get('error') if frames else check.stderr.strip()))
+            'AirTraffic backend недоступен: '+str(frames[-1].get('error') if frames else check.stderr.strip()))
     if args.check:
         # Every pymobiledevice3 module the phone steps use; a broken install or build fails here, not mid-run.
         import pymobiledevice3.lockdown, pymobiledevice3.usbmux, pymobiledevice3.services.afc, \
             pymobiledevice3.services.installation_proxy, pymobiledevice3.services.os_trace, pymobiledevice3.services.syslog
         for k,v in environment_info():print(f'{k}: {v}')
-        print('Триггеры целы, библиотеки Apple доступны; пакеты будут взяты из системы iPhone. Подключений к телефону не было.');return 0
+        print('Триггеры целы, AirTraffic backend доступен; пакеты будут взяты из системы iPhone. Подключений к телефону не было.');return 0
+    if args.atc_probe:
+        require(host_backend() == 'linux-native-atc', '--atc-probe доступен только на Linux')
+        from airtraffic_native import run_session
+        async def probe():
+            udid = await choose_device(args.udid, args.wait_seconds)
+            paired = await ready_device(udid, args.wait_seconds)
+            await paired.close()
+            await run_session(udid, CONNECTION, [], framed, lambda: None, probe=True)
+        asyncio.run(probe())
+        return 0
     args.runs=args.runs.resolve()
     try:
         args.runs.mkdir(parents=True,exist_ok=True)
