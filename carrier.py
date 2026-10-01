@@ -957,8 +957,15 @@ def load_bundle_config(path=CONFIG):
     return config
 
 
-def bundle_for(plmn, config):
-    return config.get(plmn) or config.get('default') or BUNDLE
+# "default" covers only the operators this tool is for; a foreign SIM keeps its own profile
+# unless bundle.yaml names its MCCMNC or the user picked its slot explicitly.
+HOME_MCC = ('250', '257')
+
+
+def bundle_for(plmn, config, any_mcc=False):
+    if config.get(plmn): return config[plmn]
+    if any_mcc or plmn[:3] in HOME_MCC: return config.get('default') or BUNDLE
+    return None
 
 
 # Bundle properties extracted from an IPSW by ios-bundles.github.io; file contents, not device tests.
@@ -1063,7 +1070,8 @@ def sim_line(row, top):
                          f'ICCID …{iccid[-4:]}' if len(iccid) >= 4 else 'ICCID недоступен', phone, 'сейчас: ' + current))
 
 
-def select_sims(rows, config=None, slots=SLOT_CHOICES['all']):
+def select_sims(rows, config=None, slots=SLOT_CHOICES['all'], any_mcc=True, skipped=None, only_skipped_ok=False):
+    # any_mcc=False leaves foreign SIMs without their own bundle.yaml line out; their slots go to skipped.
     selected = []; seen_slots = set(); seen_imsi = set()
     for row in rows:
         mcc, mnc = str(row.get('MCC','')), str(row.get('MNC',''))
@@ -1071,14 +1079,27 @@ def select_sims(rows, config=None, slots=SLOT_CHOICES['all']):
         require(slot in ('kOne','kTwo') and slot not in seen_slots, 'Неоднозначные слоты SIM; запись отменена.')
         seen_slots.add(slot)
         if slot not in slots: continue
+        # An empty MCC (locked phone, line off) must not pass for a foreign SIM.
+        require(re.fullmatch(r'\d{3}',mcc) and re.fullmatch(r'\d{2,3}',mnc),
+                'iPhone не сообщил оператора SIM '+(mcc+mnc or SLOT_NAMES.get(slot,str(slot)))+
+                '. Включите линию и разблокируйте телефон.')
+        bundle = bundle_for(mcc+mnc, config or {}, any_mcc)
+        if bundle is None:
+            if skipped is not None: skipped.append(slot)
+            continue
         require(re.fullmatch(r'\d{3}',mcc) and re.fullmatch(r'\d{2,3}',mnc) and isinstance(imsi,str) and
                 re.fullmatch(r'\d{15}',imsi) and imsi.startswith(mcc+mnc),
                 'iPhone не сообщил полный IMSI для SIM '+mcc+mnc+'. Включите линию и разблокируйте телефон.')
         require(imsi not in seen_imsi, 'Один IMSI указан в двух слотах; запись отменена.')
         seen_imsi.add(imsi)
-        selected.append({'slot':slot,'plmn':mcc+mnc,'imsi':imsi,'bundle':bundle_for(mcc+mnc, config or {})})
+        selected.append({'slot':slot,'plmn':mcc+mnc,'imsi':imsi,'bundle':bundle})
     missing = [SLOT_NAMES[s] for s in slots if s not in seen_slots]
     require(len(slots) > 1 or not missing, missing and missing[0]+' не найдена в iPhone. Выберите другую SIM.')
+    # --status only reads: a phone with foreign SIMs alone still shows its plan ("не трогаю").
+    if not selected and skipped and only_skipped_ok: return selected
+    require(selected or skipped is None or not skipped,
+            'Нет SIM операторов России или Беларуси. Чтобы сменить профиль зарубежной SIM, добавьте её MCCMNC '
+            'в bundle.yaml или выберите эту SIM в пункте 7 (флаг --sims 1 или 2).')
     require(selected, 'Телефон не сообщил ни одной SIM с доступным IMSI.')
     return selected
 
@@ -1251,6 +1272,16 @@ def report_log(path, sims):
                     results[slot].update(selected=resolved[0].strip().rsplit('/',1)[-1],
                                          verified=verified==['Success'])
     return list(results.values())
+
+
+def slot_outcome(result, ok):
+    # One line per SIM after the rescan; the wording is what users paste into bug reports.
+    expected = (result['expected'] or '').removesuffix('.bundle')
+    selected = (result['selected'] or '').removesuffix('.bundle')
+    if ok: return (selected or 'штатный профиль') + ' — подпись принята'
+    if not selected: return 'в журнале пересканирования нет выбора пакета для этой SIM'
+    if expected and selected.lower() != expected.lower(): return f'iOS выбрала {selected} вместо {expected}'
+    return f'{selected} выбран, но подпись не принята'
 
 
 def read_json(path):
@@ -1604,7 +1635,10 @@ async def execute(args,assets):
         rows=await device.get_value(key='CarrierBundleInfoArray') or []
         top=await device.get_value() or {}
         slots=SLOT_CHOICES[args.sims]
-        sims=select_sims(rows,args.bundles,slots) if not (args.restore or args.restore_backup or args.recover) else []
+        # A slot picked by number is the user's explicit choice; "all" leaves foreign SIMs alone.
+        any_mcc=args.sims!='all'; skipped=[]
+        sims=(select_sims(rows,args.bundles,slots,any_mcc,skipped,only_skipped_ok=args.status)
+              if not (args.restore or args.restore_backup or args.recover) else [])
         restore_imsis=None
         if args.restore:
             sims=[{'slot':r['Slot'],'plmn':str(r.get('MCC',''))+str(r.get('MNC','')),'bundle':None}
@@ -1617,6 +1651,9 @@ async def execute(args,assets):
         for s in sims:
             target='штатный профиль' if args.restore else s['bundle'].removesuffix('.bundle')+' (по IMSI)'
             print(f"  {sim_line(row_by_slot[s['slot']],top)}  →  план: {target}",flush=True)
+        for slot in skipped:
+            print(f"  {sim_line(row_by_slot[slot],top)}  →  план: не трогаю (зарубежная SIM: добавьте её MCCMNC "
+                  "в bundle.yaml или выберите эту SIM в пункте 7)",flush=True)
         print(flush=True)
         bundles=sorted({s['bundle'] for s in sims if s['bundle']})
         if bundles:
@@ -1722,7 +1759,7 @@ async def execute(args,assets):
             print('[2/4] Сохраняю исходные настройки…',flush=True)
             original=await transfer(device,run/'snapshot')
             require(original is not None,'Не удалось сохранить исходный каталог.')
-            current=select_sims(await device.get_value(key='CarrierBundleInfoArray') or [],args.bundles,slots)
+            current=select_sims(await device.get_value(key='CarrierBundleInfoArray') or [],args.bundles,slots,any_mcc)
             require(current==sims,'SIM изменились во время операции; запись отменена.')
             desired=make_plan(original,sims)
             save_json(run/'plan.json',{'slots':[{k:v for k,v in s.items() if k!='imsi'} for s in sims],
@@ -1742,8 +1779,7 @@ async def execute(args,assets):
         unconfirmed=False
         for s in result:
             ok=s['verified'] and (args.restore or (s['selected'] or '').lower()==s['expected'].lower());unconfirmed |= not ok
-            print(f"{SLOT_NAMES[s['slot']]} ({s['plmn']}): "+(s['selected']+' — подпись принята' if ok else
-                  'выбор нужного пакета не подтверждён; см. журнал'),flush=True)
+            print(f"{SLOT_NAMES[s['slot']]} ({s['plmn']}): "+slot_outcome(s,ok),flush=True)
         if args.restore:
             print(('Ссылка по IMSI выбранной SIM удалена, другая SIM не тронута.' if restore_imsis else
                    'Все ссылки по IMSI удалены.')+' Обычные ссылки операторов сохранены.',flush=True)
@@ -1761,8 +1797,8 @@ async def execute(args,assets):
         if missing:
             # AFC cannot read /System, so a missing bundle only shows up in the rescan log.
             # Never leave links to it: put back the catalog saved before this write.
-            print('iOS не выбрала '+', '.join(missing)+': такого пакета, видимо, нет в этой '
-                  'версии iOS или имя введено с ошибкой. Возвращаю прежние настройки…',flush=True)
+            print('iOS не выбрала '+', '.join(missing)+': пакета может не быть в этой версии iOS, имя может '
+                  'быть с ошибкой, или iOS отдаёт этой SIM другой пакет. Возвращаю прежние настройки…',flush=True)
             # The rescan trigger may have touched other parts of the catalog since the readback;
             # only this run's IMSI links must still be exactly as written.
             await transfer(device,run/'rollback',payload=original,
@@ -1775,7 +1811,13 @@ async def execute(args,assets):
                                          'rolled_back':True})
             print('Прежние настройки возвращены. Проверьте имя пакета (bundle.yaml или пункт 7) и повторите.',flush=True)
             return UNCONFIRMED
-        if unconfirmed:return UNCONFIRMED
+        if unconfirmed:
+            print(('Каталог записан, но журнал не подтвердил выбор. Включите авиарежим на 15 секунд и откройте '
+                   'пункт 2 (--status): в строке «сейчас» должен быть нужный профиль. Если там прежний, '
+                   'верните штатный пунктом 4 и пришлите автору журнал операции.') if installing else
+                  ('Журнал не подтвердил выбор штатного профиля. Включите авиарежим на 15 секунд и откройте '
+                   'пункт 2 (--status): в строке «сейчас» должен быть профиль оператора.'),flush=True)
+            return UNCONFIRMED
         print('Books: служебные файлы синхронизации возвращены в исходное состояние'+books_summary(run)+'.',flush=True)
         print('Готово. Включите авиарежим на 15 секунд и проверьте связь. Работа 5G не проверялась.')
         return 0
@@ -2036,7 +2078,7 @@ def main():
             native_host(value.get('udid'),value.get('assets',[]),value.get('directories',[]))
             return 0
         except Exception as e:framed({'ok':False,'error':str(e)});return 1
-    parser=argparse.ArgumentParser(description='Vodafone_hu для всех SIM независимо от страны. '
+    parser=argparse.ArgumentParser(description='Профиль из bundle.yaml для SIM России и Беларуси; зарубежные — только по явному выбору. '
         'Без флагов: установить по IMSI на SIM, сообщённые iPhone. Без ограничений по модели iPhone и версии iOS; совместимость не гарантируется.',
         add_help=False)
     parser.add_argument('--version', action='version', version=f'CarrierSIM {VERSION}')
@@ -2052,7 +2094,8 @@ def main():
     parser.add_argument('--bundle',metavar='ПАКЕТ',
                         help='один системный пакет для всех выбранных SIM вместо bundle.yaml, например O2_Germany')
     parser.add_argument('--sims',choices=SLOT_CHOICES,default='all',
-                        help='какие SIM менять (установка и --restore): 1, 2 или all — все найденные (по умолчанию)')
+                        help='какие SIM менять (установка и --restore): 1, 2 или all — все найденные (по умолчанию; '
+                             'при установке all пропускает зарубежные SIM без своей строки в bundle.yaml)')
     parser.add_argument('--trigger',type=Path,metavar='IPCC',help='свой подписанный IPCC вместо комплектного; плата и SIM проверяются')
     parser.add_argument('--attempts',type=int,default=3,metavar='N',help='попытки при временном сбое связи (по умолчанию 3)')
     parser.add_argument('--seconds',type=int,metavar='СЕК',help='длительность --diagnose (по умолчанию 90) или --watch-call (по умолчанию 180)')
