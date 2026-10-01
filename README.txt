@@ -271,6 +271,14 @@ USB. Скачайте «Apple Mobile Device USB Driver» из Microsoft Update C
 выполните в папке с файлами: pnputil /add-driver usbaapl64.inf /install,
 затем перезагрузите компьютер. Переустановка iTunes не всегда помогает.
 
+«Grappa session could not be established» в журнале iPhone (Windows,
+«Синхронизация закончилась преждевременно»): iPhone не принял компоненты
+Apple, повтор не поможет. Удалите iTunes (и версию из Microsoft Store),
+поставьте полный iTunes x64 с https://support.apple.com/en-us/106372 (не
+только AppleMobileDeviceSupport64.msi из него), запустите его один раз и
+повторите. В одном случае помогла только версия 12.11.0.26, и перед этим
+пришлось удалить старую медиатеку iTunes.
+
 InstallProhibited: установку запрещает «Экранное время» («Ограничения контента
 и конфиденциальности → Покупки в iTunes Store и App Store → Установка
 приложений: Да») или профиль управления (MDM). На телефоне ничего не меняется.

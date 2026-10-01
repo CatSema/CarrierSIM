@@ -529,6 +529,29 @@ def device_log(device, path):
     return syslog_capture(device, path, lambda line: any(k in line.lower() for k in DEVICE_LOG_KEYS))
 
 
+# atc on the phone logs this when it rejects the computer's Apple components. Seen on Windows with
+# some iTunes installs, fixed by reinstalling iTunes; another attempt with the same components fails alike.
+GRAPPA_REFUSED = 'Grappa session could not be established'
+
+
+def grappa_refused(log):
+    with contextlib.suppress(OSError):
+        return GRAPPA_REFUSED in log.read_text(encoding='utf-8', errors='replace')
+    return False
+
+
+def grappa_hint():
+    text = ('iPhone не принял компоненты Apple на этом компьютере (в журнале iPhone: «' + GRAPPA_REFUSED + '»), '
+            'повтор не поможет.')
+    if sys.platform == 'win32':
+        text += (' Переустановите iTunes: удалите его (и версию из Microsoft Store, если есть), установите iTunes x64 '
+                 'с сайта Apple (https://support.apple.com/en-us/106372), запустите один раз и повторите. '
+                 'Подробнее — README, раздел «Grappa session could not be established».')
+    else:
+        text += ' Скопируйте блок отладки ниже в issue на GitHub.'
+    return text
+
+
 async def transfer(device, run, payload=None, expected=None, recovery=False):
     from pymobiledevice3.services.afc import AfcService
     run.mkdir(parents=True, exist_ok=False)
@@ -611,8 +634,13 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
                 require(await remote_tree(afc, exported) == snapshot, 'Export changed after backup')
                 phase('final-authorized')
             phase('host-started')
-            async with device_log(device, run / 'device.log'):
-                await host_session(device.udid, assets, pause, run)
+            try:
+                async with device_log(device, run / 'device.log'):
+                    await host_session(device.udid, assets, pause, run)
+            except Exception as error:
+                # Without "Сбой AirTraffic" the error is not transient: roll back once, do not retry.
+                if grappa_refused(run / 'device.log'): raise RuntimeError(grappa_hint()) from error
+                raise
             # The phone may take several seconds to move the final asset after the session ends.
             for _ in range(150):
                 if await exists(afc, final_source) is None:

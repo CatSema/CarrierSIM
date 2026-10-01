@@ -156,6 +156,8 @@ default: Vodafone_hu
 
 **Windows не видит iPhone.** В «Проводнике» телефон есть (как `Apple iPhone`, видны фото), а iTunes и скрипт его не находят. Значит, не установлен драйвер Apple Mobile Device USB. Переустановка iTunes не всегда помогает. Скачайте драйвер «Apple Mobile Device USB Driver» из [Microsoft Update Catalog](https://www.catalog.update.microsoft.com/Search.aspx?q=Apple%20Mobile%20Device%20USB%20Driver), распакуйте `.cab` и в командной строке от администратора выполните `pnputil /add-driver usbaapl64.inf /install` из папки с распакованными файлами. Затем перезагрузите компьютер.
 
+**«Grappa session could not be established».** Windows: «Сбой AirTraffic: Синхронизация закончилась преждевременно», а в журнале iPhone эта строка. Значит, iPhone не принял установленные компоненты Apple, и повтор не поможет. Удалите iTunes (и версию из Microsoft Store, если есть), установите iTunes x64 с [сайта Apple](https://support.apple.com/en-us/106372), запустите его один раз и повторите. Ставьте полный установщик iTunes, а не только `AppleMobileDeviceSupport64.msi` из него. В одном случае помогла только версия 12.11.0.26, и перед первым запуском пришлось удалить старую медиатеку iTunes (иначе iTunes выдавал ошибку).
+
 **«iPhone запрещает установку (InstallProhibited)».** В «Экранном времени» запрещена установка приложений: «Настройки → Экранное время → Ограничения контента и конфиденциальности → Покупки в iTunes Store и App Store → Установка приложений» — поставьте «Да» на время установки. То же бывает у телефонов с профилем управления (MDM).
 
 **«iPhone запрещает изменить Books/Books.plist, а в нём остались записи скрипта».** Сохраните папку `runs` с резервными копиями. В одном случае помогла такая последовательность:

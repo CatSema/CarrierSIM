@@ -659,6 +659,28 @@ class OutcomeTest(unittest.TestCase):
         self.assertIn('подпись не принята', carrier.slot_outcome(r('Vodafone_tr.bundle', False), False))
 
 
+class GrappaTest(unittest.TestCase):
+    LINE = ('Sep 30 23:58:12 iPhone atc(AirTrafficDevice)[56] <Error>: '
+            'Grappa session could not be established. Aborting\n')
+
+    def test_refusal_is_found_in_the_device_log_only_when_logged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = pathlib.Path(temp) / 'device.log'
+            self.assertFalse(carrier.grappa_refused(log))
+            log.write_text('atc(AirTrafficDevice)[56] <Notice>: SyncAllowed\n', encoding='utf-8')
+            self.assertFalse(carrier.grappa_refused(log))
+            log.write_text(self.LINE, encoding='utf-8')
+            self.assertTrue(carrier.grappa_refused(log))
+
+    def test_hint_is_not_retried_and_names_the_fix_on_windows(self):
+        for platform, fix in (('win32', 'support.apple.com/en-us/106372'), ('darwin', 'блок отладки')):
+            with self.subTest(platform=platform), patch.object(carrier.sys, 'platform', platform):
+                hint = carrier.grappa_hint()
+                self.assertIn(fix, hint)
+                self.assertIn(carrier.GRAPPA_REFUSED, hint)
+                self.assertFalse(carrier.transient_error(RuntimeError(hint)))
+
+
 class VersionTest(unittest.TestCase):
     def test_cli_version_and_help_work_without_apple_services(self):
         for flag, expected in (('--version', f'CarrierSIM {VERSION}'), ('--help', '--recover')):
