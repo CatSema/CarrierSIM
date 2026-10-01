@@ -27,7 +27,7 @@ class LinuxBackendTest(unittest.TestCase):
 
     def test_apple_worker_rejects_linux_probe(self):
         with patch.object(carrier, 'host_backend', return_value='apple'), \
-             patch.object(carrier, 'native_host') as apple:
+             patch('airtraffic_apple.run_worker') as apple:
             with self.assertRaisesRegex(RuntimeError, 'только на Linux'):
                 carrier.host_worker({'probe': True})
             apple.assert_not_called()

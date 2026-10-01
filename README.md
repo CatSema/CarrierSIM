@@ -155,6 +155,8 @@ default: Vodafone_hu
 
 На iPhone 17 также подтверждён звонок по VoWiFi. Эти проверки выполнены на Linux.
 
+Вызовы Apple и обмен AirTraffic вынесены в `airtraffic_apple.py`. Модуль работает в отдельном процессе; `carrier.py` ведёт журнал и подтверждает резервную копию перед финальным переносом. При импорте модуль не загружает библиотеки Apple.
+
 Пункт **4** удаляет из корня каталога все симлинки с именем из 15 цифр. Остальное содержимое каталога, включая симлинки по MCCMNC и пакеты IPCC, не трогается.
 
 ## Если что-то пошло не так
@@ -179,7 +181,9 @@ default: Vodafone_hu
 
 **Windows не видит iPhone.** В «Проводнике» телефон есть (как `Apple iPhone`, видны фото), а iTunes и скрипт его не находят. Значит, не установлен драйвер Apple Mobile Device USB. Переустановка iTunes не всегда помогает. Скачайте драйвер «Apple Mobile Device USB Driver» из [Microsoft Update Catalog](https://www.catalog.update.microsoft.com/Search.aspx?q=Apple%20Mobile%20Device%20USB%20Driver), распакуйте `.cab` и в командной строке от администратора выполните `pnputil /add-driver usbaapl64.inf /install` из папки с распакованными файлами. Затем перезагрузите компьютер.
 
-**«Grappa session could not be established».** Скрипт пишет «iPhone не принял компоненты Apple на этом компьютере» (версии до этой — «Сбой AirTraffic: Синхронизация закончилась преждевременно»), в журнале iPhone эта строка. Встречалось на Windows. Значит, iPhone не принял установленные компоненты Apple, и повтор не поможет. Удалите iTunes (и версию из Microsoft Store, если есть), установите iTunes x64 с [сайта Apple](https://support.apple.com/en-us/106372), запустите его один раз и повторите. Ставьте полный установщик iTunes, а не только `AppleMobileDeviceSupport64.msi` из него. В одном случае помогла только версия 12.11.0.26, и перед первым запуском пришлось удалить старую медиатеку iTunes (иначе iTunes выдавал ошибку).
+**«Grappa session could not be established».** iPhone отклонил обмен AirTraffic с компьютером. На Windows вызов `ATHostConnectionSendSyncRequest` мог приводить к этому сбою ещё при сохранении исходного каталога. Скрипт теперь создаёт соединение через `ATHostConnectionCreateWithLibrary` и отправляет `RequestingSync` с готовыми данными Grappa. Успешный обмен AirTraffic сам по себе не подтверждает работу VoWiFi, EVS или 5G.
+
+Если ошибка осталась, скрипт пишет «iPhone не принял компоненты Apple на этом компьютере» и не повторяет ту же попытку. Удалите iTunes (и версию из Microsoft Store, если есть), установите iTunes x64 с [сайта Apple](https://support.apple.com/en-us/106372), запустите его один раз и повторите. Ставьте полный установщик iTunes, а не только `AppleMobileDeviceSupport64.msi` из него. В одном случае помогла только версия 12.11.0.26, и перед первым запуском пришлось удалить старую медиатеку iTunes (иначе iTunes выдавал ошибку).
 
 **«iPhone запрещает установку (InstallProhibited)».** В «Экранном времени» запрещена установка приложений: «Настройки → Экранное время → Ограничения контента и конфиденциальности → Покупки в iTunes Store и App Store → Установка приложений» — поставьте «Да» на время установки. То же бывает у телефонов с профилем управления (MDM).
 
@@ -241,6 +245,8 @@ python3 carrier.py --help                            # все флаги
 
 На Windows вместо `python3` пишите `py`. Подробное техническое описание есть в [README.txt](README.txt).
 
+**Библиотеки iTunes из Microsoft Store.** Для нестандартной установки укажите папку библиотек через `py carrier.py --check --apple-dir "C:\AppleRuntime"`; при установке используйте тот же `--apple-dir`. Путь к пакету можно узнать командой PowerShell `Get-AppxPackage AppleInc.iTunes | Select-Object -ExpandProperty InstallLocation`. При загрузке прямо из `WindowsApps` возможен `WinError 5`: в этом случае скопируйте DLL из корня пакета, папку `CoreFoundation.resources` и DLL из его `AMDS64` в отдельную папку, например `C:\AppleRuntime`. Используйте файлы одной версии. Эта настройка выбирает библиотеки AirTraffic; для связи с iPhone нужны также работающая служба и драйвер Apple Mobile Device.
+
 ---
 
 ## Лицензия
@@ -250,6 +256,7 @@ python3 carrier.py --help                            # все флаги
 Сторонний код сохраняет свои лицензии. Лицензия CarrierSIM не распространяется на файлы Apple, включая IPCC-триггеры в `assets.zip`, системные пакеты операторов и библиотеки Apple: права на них принадлежат соответствующим правообладателям.
 
 Протокол переноса основан на [AirLift](https://github.com/0xjohnnydev/airlift) (MIT, лицензия в [LICENSE-AirLift.txt](LICENSE-AirLift.txt)).
+Обмен Grappa на Windows адаптирован из [AirCard-Windows](https://github.com/dhava-gautama/AirCard-Windows/blob/e0eadb0c88da55516f1c9f939fd4ce27560910d5/src/airtraffic.rs); лицензия MIT — в [LICENSE-AirCard.txt](LICENSE-AirCard.txt). Готовые данные Grappa в этом коде взяты из `yinyajiang/go-tunes`.
 
 ## Автоматические проверки
 

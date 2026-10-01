@@ -51,7 +51,7 @@ jobs:
           python -m pip check
           python tests/check_dependencies.py
       - name: Compile Python sources
-        run: python -m compileall -q carrier.py airtraffic_native.py launch.py carriersim_version.py tests .github/scripts
+        run: python -m compileall -q carrier.py airtraffic_apple.py airtraffic_native.py launch.py carriersim_version.py tests .github/scripts
       - name: Check Linux AirTraffic backend without a phone
         if: runner.os == 'Linux'
         run: |

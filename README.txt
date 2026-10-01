@@ -146,6 +146,16 @@ Windows с нестандартной установкой Apple — укажи�
 установленной версии:
 py carrier.py --check --apple-dir "C:\путь\Mobile Device Support" --apple-dir "C:\путь\Apple Application Support"
 
+Для iTunes из Microsoft Store путь к пакету покажет PowerShell:
+Get-AppxPackage AppleInc.iTunes | Select-Object -ExpandProperty InstallLocation
+Если загрузка из WindowsApps даёт WinError 5, скопируйте DLL из корня
+пакета, папку CoreFoundation.resources и DLL из AMDS64 в отдельную папку.
+Укажите её через --apple-dir при проверке и установке. Используйте файлы
+одной версии. Служба и драйвер Apple Mobile Device нужны для связи с iPhone.
+Вызовы Apple и обмен AirTraffic находятся в airtraffic_apple.py; при
+импорте модуля DLL не загружаются. carrier.py ведёт журнал и подтверждает
+резервную копию перед финальным переносом в отдельном процессе AirTraffic.
+
 Скрипт не скачивает пакеты или DLL; интернет нужен только для зависимостей.
 IMSI не выводится в консоль, но есть в копиях и журналах: не публикуйте runs.
 Папка runs уже исключена в .gitignore. Свою папку (--runs ПАПКА) внутри
@@ -286,8 +296,14 @@ USB. Скачайте «Apple Mobile Device USB Driver» из Microsoft Update C
 
 «iPhone не принял компоненты Apple на этом компьютере» (раньше: «Сбой
 AirTraffic: Синхронизация закончилась преждевременно»), в журнале iPhone
-«Grappa session could not be established». Встречалось на Windows, повтор
-не поможет. Удалите iTunes (и версию из Microsoft Store),
+«Grappa session could not be established». iPhone отклонил обмен AirTraffic.
+На Windows ATHostConnectionSendSyncRequest мог приводить к этому сбою ещё
+при сохранении исходного каталога. Теперь скрипт создаёт соединение через
+ATHostConnectionCreateWithLibrary и отправляет RequestingSync с готовыми
+данными Grappa. Успешный обмен AirTraffic сам по себе не подтверждает
+работу VoWiFi, EVS или 5G.
+
+Если ошибка осталась, повтор не поможет. Удалите iTunes (и версию из Microsoft Store),
 поставьте полный iTunes x64 с https://support.apple.com/en-us/106372 (не
 только AppleMobileDeviceSupport64.msi из него), запустите его один раз и
 повторите. В одном случае помогла только версия 12.11.0.26, и перед этим
@@ -550,6 +566,10 @@ SHA256 5f8166b3e33d14230273b85320795f1eb1f29214d2c0594056d0b0e448c029f1
 iPhone 18 Pro: https://www.apple.com/iphone-18-pro/specs/
 Протокол переноса основан на AirLift (0xjohnnydev/airlift, c75b3ea),
 лицензия MIT приложена (LICENSE-AirLift.txt).
+Обмен Grappa на Windows адаптирован из dhava-gautama/AirCard-Windows,
+src/airtraffic.rs, коммит e0eadb0c88da55516f1c9f939fd4ce27560910d5;
+лицензия MIT приложена (LICENSE-AirCard.txt). Готовые данные Grappa в этом
+коде взяты из yinyajiang/go-tunes.
 
 ЛИЦЕНЗИЯ
 Собственный код CarrierSIM распространяется под MIT (файл LICENSE).

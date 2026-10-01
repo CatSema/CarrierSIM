@@ -763,93 +763,6 @@ from datetime import datetime
 APPLE_DIRS = []
 ASSET_SHA256 = '6de1ea0be81a29c145ef414f24bc21d1dcb8a4eb737b22b1f956e9a6f0c2098b'
 
-class AppleHost:
-    def __init__(self, directories=()):
-        self.handles = []
-        self.pool = None
-        if sys.platform == 'darwin':
-            self.cf = C.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
-            self.at = C.CDLL('/System/Library/PrivateFrameworks/AirTrafficHost.framework/AirTrafficHost')
-            self.objc = C.CDLL('/usr/lib/libobjc.A.dylib')
-            self.objc.objc_autoreleasePoolPush.restype = C.c_void_p
-            self.objc.objc_autoreleasePoolPush.argtypes = []
-            self.objc.objc_autoreleasePoolPop.argtypes = [C.c_void_p]
-            self.objc.objc_autoreleasePoolPop.restype = None
-            self.pool = self.objc.objc_autoreleasePoolPush()
-        elif sys.platform == 'win32':
-            require(C.sizeof(C.c_void_p) == 8, 'Нужен 64-битный Python и 64-битные компоненты Apple.')
-            paths = [Path(p).resolve() for p in directories]
-            for key in ('CommonProgramW6432', 'CommonProgramFiles'):
-                base = os.environ.get(key)
-                if base:
-                    paths += [Path(base)/'Apple'/'Mobile Device Support',
-                              Path(base)/'Apple'/'Apple Application Support']
-            paths = list(dict.fromkeys(p for p in paths if p.is_dir()))
-            for p in paths:
-                self.handles.append(os.add_dll_directory(str(p)))
-            def load(name):
-                candidates = [p/name for p in paths if (p/name).is_file()]
-                require(candidates, 'Не найдена ' + name + '. Установите iTunes x64 с сайта Apple '
-                        'или укажите папки библиотек через --apple-dir. Версия Microsoft Store может не подойти.')
-                return C.CDLL(str(candidates[0]), winmode=0x1100)
-            self.cf = load('CoreFoundation.dll')
-            self.at = load('AirTrafficHost.dll')
-        else:
-            raise RuntimeError('Поддерживаются macOS и Windows.')
-        P, I, U = C.c_void_p, C.c_ssize_t, C.c_size_t
-        def bind(lib, name, result, args):
-            f = getattr(lib, name); f.restype = result; f.argtypes = args
-        for name, result, args in [
-            ('CFDataCreate', P, [P,P,I]), ('CFDataGetLength', I, [P]),
-            ('CFDataGetBytePtr', P, [P]), ('CFRelease', None, [P]),
-            ('CFPropertyListCreateWithData', P, [P,P,U,P,P]),
-            ('CFPropertyListCreateData', P, [P,P,I,U,P])]:
-            bind(self.cf, name, result, args)
-        for name, result, args in [
-            ('ATHostConnectionCreate', P, [P]), ('ATHostConnectionRelease', None, [P]),
-            ('ATHostConnectionReadMessage', P, [P]),
-            ('ATHostConnectionSendHostInfo', None, [P,P]),
-            ('ATHostConnectionSendSyncRequest', None, [P,P,P,P]),
-            ('ATHostConnectionSendMetadataSyncFinished', None, [P,P,P]),
-            ('ATHostConnectionSendAssetCompleted', None, [P,P,P,P]),
-            ('ATCFMessageGetName', P, [P]), ('ATCFMessageGetParam', P, [P,P])]:
-            bind(self.at, name, result, args)
-
-    def encode(self, value):
-        raw = plistlib.dumps(value, fmt=plistlib.FMT_BINARY)
-        buf = C.create_string_buffer(raw)
-        data = self.cf.CFDataCreate(None, buf, len(raw))
-        require(data, 'CFDataCreate failed')
-        try:
-            result = self.cf.CFPropertyListCreateWithData(None, data, 0, None, None)
-            require(result, 'CFPropertyListCreateWithData failed')
-            return result
-        finally:
-            self.cf.CFRelease(data)
-
-    def decode(self, value):
-        require(value, 'Пустое сообщение Apple')
-        data = self.cf.CFPropertyListCreateData(None, value, 200, 0, None)
-        require(data, 'CFPropertyListCreateData failed')
-        try:
-            size = self.cf.CFDataGetLength(data)
-            require(0 <= size <= MAX_BYTES, 'Слишком большое сообщение Apple')
-            return plistlib.loads(C.string_at(self.cf.CFDataGetBytePtr(data), size))
-        finally:
-            self.cf.CFRelease(data)
-
-    def call(self, name, connection, *values):
-        refs = []
-        try:
-            for v in values: refs.append(self.encode(v))
-            return getattr(self.at, name)(connection, *refs)
-        finally:
-            for ref in refs: self.cf.CFRelease(ref)
-
-    def close(self):
-        if self.pool:
-            self.objc.objc_autoreleasePoolPop(self.pool); self.pool = None
-
 
 def error_text(error):
     # TimeoutError and pymobiledevice3's connection errors often carry no message;
@@ -875,73 +788,6 @@ def framed(value):
     print('CARRIER_SWAP_JSON:' + json.dumps(value), flush=True)
 
 
-def native_host(udid, assets, directories):
-    host = AppleHost(directories)
-    connection = None
-    try:
-        sample = {'test': ['Book', 1, False]}
-        ref = host.encode(sample)
-        try: require(host.decode(ref) == sample, 'Ошибка обмена с CoreFoundation')
-        finally: host.cf.CFRelease(ref)
-        if udid is None:
-            framed({'ok': True, 'deviceConnections': 0}); return
-        ref = host.encode(udid)
-        try: connection = host.at.ATHostConnectionCreate(ref)
-        finally: host.cf.CFRelease(ref)
-        require(connection, 'Не удалось открыть AirTraffic. Закройте синхронизацию iTunes/Finder.')
-        def until(wanted, limit):
-            for _ in range(limit):
-                msg = host.at.ATHostConnectionReadMessage(connection)
-                if not msg: continue
-                try:
-                    name = host.decode(host.at.ATCFMessageGetName(msg))
-                    try: body = json.dumps(host.decode(msg), ensure_ascii=False, default=str)[:4000]
-                    except Exception as e: body = 'не прочитано: ' + error_text(e)
-                    framed({'event': 'message', 'name': name, 'body': body})
-                    if name == wanted:
-                        if name != 'AssetManifest': return True
-                        key = host.encode('AssetManifest')
-                        try: return host.decode(host.at.ATCFMessageGetParam(msg, key))
-                        finally: host.cf.CFRelease(key)
-                    require(name not in ('SyncFailed','SyncFinished'), 'Синхронизация закончилась преждевременно')
-                finally: host.cf.CFRelease(msg)
-            raise RuntimeError('Не получено сообщение ' + wanted)
-        until('SyncAllowed', 8)
-        info = {'Type':'iTunes', 'Version':'13.7.0.161', 'SyncHostName':'CarrierSIM',
-                'LibraryID':str(uuid.uuid4()), 'SyncedDataclasses':['Book'],
-                'SyncedAssetTypes':['Book'], 'Wakeable':False}
-        if sys.platform == 'darwin':
-            import platform
-            info['MacOSVersion'] = platform.mac_ver()[0]
-        host.call('ATHostConnectionSendHostInfo', connection, info)
-        time.sleep(.2)
-        host.call('ATHostConnectionSendSyncRequest', connection, ['Book'], {}, info)
-        until('ReadyForSync', 12)
-        host.call('ATHostConnectionSendMetadataSyncFinished', connection, {'Book':1}, {})
-        manifest = until('AssetManifest', 20)
-        require(isinstance(manifest,dict), 'Неверный манифест AirTraffic')
-        books = [r for r in manifest.get('Book',[]) if isinstance(r,dict)]
-        found = {r.get('AssetID') for r in books if r.get('IsDownload')}
-        missing = [a for a,_ in assets if a not in found]
-        if missing:
-            # Keep what the phone actually answered: host.jsonl in the run folder.
-            framed({'event':'manifest','dataclasses':sorted(map(str,manifest)),'expected':[a for a,_ in assets],
-                    'book':[{k:str(v) for k,v in r.items()} for r in books[:50]]})
-            raise RuntimeError(f'AirTraffic не подтвердил нужные объекты: iPhone вернул {len(books)} '
-                               f'объект(ов) Book, не хватает {len(missing)} из {len(assets)}')
-        for i,(identifier,destination) in enumerate(assets):
-            if i == 2:
-                framed({'event':'before-final-asset'})
-                require(sys.stdin.readline().strip() == 'CONTINUE', 'Резервная копия не подтверждена')
-            host.call('ATHostConnectionSendAssetCompleted', connection, identifier, 'Book', destination)
-            if i+1 < len(assets): time.sleep(.9)
-        time.sleep(6)
-        framed({'ok':True})
-    finally:
-        if connection: host.at.ATHostConnectionRelease(connection)
-        host.close()
-
-
 def host_backend(platform_name=None):
     platform_name = platform_name or sys.platform
     if platform_name in ('darwin', 'win32'):
@@ -955,7 +801,8 @@ def host_worker(config):
     if host_backend() == 'apple':
         if config.get('probe'):
             raise RuntimeError('--atc-probe доступен только на Linux')
-        return native_host(config.get('udid'), config.get('assets', []), config.get('directories', []))
+        from airtraffic_apple import run_worker
+        return run_worker(config.get('udid'), config.get('assets', []), config.get('directories', []), framed)
     from airtraffic_native import run_worker
     return asyncio.run(run_worker(config.get('udid'), config.get('assets', []),
                                   config.get('connection', 'USB'), framed, config.get('probe', False)))
@@ -2482,7 +2329,7 @@ def print_diagnostics(error):
         except Exception as e: rows.append(('Журналы', f'не прочитаны: {error_text(e)}'))
     rows.append(('Ошибка', error_line(error)))
     import traceback
-    frames = [f for f in traceback.extract_tb(error.__traceback__) if f.filename.endswith(('carrier.py', 'launch.py'))]
+    frames = [f for f in traceback.extract_tb(error.__traceback__) if f.filename.endswith(('carrier.py', 'launch.py', 'airtraffic_apple.py'))]
     if frames:
         rows.append(('Где', ' → '.join(f'{f.name}:{f.lineno}' for f in frames[-4:])))
     if DIAG.get('session_log'): rows.append(('Журнал сеанса', DIAG['session_log']))
