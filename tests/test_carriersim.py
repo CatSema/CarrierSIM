@@ -673,12 +673,27 @@ class GrappaTest(unittest.TestCase):
             self.assertTrue(carrier.grappa_refused(log))
 
     def test_hint_is_not_retried_and_names_the_fix_on_windows(self):
-        for platform, fix in (('win32', 'support.apple.com/en-us/106372'), ('darwin', 'блок отладки')):
+        for platform, fix in (('win32', 'support.apple.com/en-us/106372'), ('darwin', 'блок отладки выше')):
             with self.subTest(platform=platform), patch.object(carrier.sys, 'platform', platform):
                 hint = carrier.grappa_hint()
                 self.assertIn(fix, hint)
                 self.assertIn(carrier.GRAPPA_REFUSED, hint)
                 self.assertFalse(carrier.transient_error(RuntimeError(hint)))
+
+    def test_only_the_host_failure_becomes_a_refusal(self):
+        cause = 'Сбой AirTraffic: Синхронизация закончилась преждевременно'
+        with tempfile.TemporaryDirectory() as temp:
+            log = pathlib.Path(temp) / 'device.log'
+            log.write_text(self.LINE, encoding='utf-8')
+            refused = carrier.grappa_failure(RuntimeError(cause), log)
+            self.assertIsInstance(refused, carrier.GrappaRefused)
+            self.assertIn(cause, str(refused))
+            self.assertFalse(carrier.transient_error(refused))
+            # A dropped AFC link during the pause stays itself and is retried.
+            self.assertIsNone(carrier.grappa_failure(ConnectionResetError(54, 'reset'), log))
+            self.assertIsNone(carrier.grappa_failure(RuntimeError('Книги изменились'), log))
+            log.write_text('atc <Notice>: SyncFailed\n', encoding='utf-8')
+            self.assertIsNone(carrier.grappa_failure(RuntimeError(cause), log))
 
 
 class VersionTest(unittest.TestCase):

@@ -540,7 +540,11 @@ def grappa_refused(log):
     return False
 
 
-def grappa_hint():
+class GrappaRefused(RuntimeError):
+    pass
+
+
+def grappa_hint(cause=''):
     text = ('iPhone не принял компоненты Apple на этом компьютере (в журнале iPhone: «' + GRAPPA_REFUSED + '»), '
             'повтор не поможет.')
     if sys.platform == 'win32':
@@ -548,8 +552,16 @@ def grappa_hint():
                  'с сайта Apple (https://support.apple.com/en-us/106372), запустите один раз и повторите. '
                  'Подробнее — README, раздел «Grappa session could not be established».')
     else:
-        text += ' Скопируйте блок отладки ниже в issue на GitHub.'
-    return text
+        text += ' Скопируйте блок отладки выше в issue на GitHub.'
+    # The host's own error stays in the message: journals and the debug block keep the real failure.
+    return text + (f' Ошибка хоста: {cause}' if cause else '')
+
+
+def grappa_failure(error, log):
+    # Only the host's own failure: an AFC or Books error inside the pause keeps its cause and retries.
+    if isinstance(error, RuntimeError) and 'Сбой AirTraffic' in str(error) and grappa_refused(log):
+        return GrappaRefused(grappa_hint(str(error)))
+    return None
 
 
 async def transfer(device, run, payload=None, expected=None, recovery=False):
@@ -638,8 +650,7 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
                 async with device_log(device, run / 'device.log'):
                     await host_session(device.udid, assets, pause, run)
             except Exception as error:
-                # Without "Сбой AirTraffic" the error is not transient: roll back once, do not retry.
-                if grappa_refused(run / 'device.log'): raise RuntimeError(grappa_hint()) from error
+                if (refused := grappa_failure(error, run / 'device.log')): raise refused from error
                 raise
             # The phone may take several seconds to move the final asset after the session ends.
             for _ in range(150):
@@ -1302,6 +1313,7 @@ def transient_error(error):
     if isinstance(error,OSError) and error.errno in (32,54,60,104,110,50,51,64,65,
                                                      10050,10051,10054,10060,10064,10065):return True
     # The phone answering without our assets is deterministic: retrying only repeats it.
+    if isinstance(error,GrappaRefused):return False
     return isinstance(error,RuntimeError) and any(t in str(error) for t in
         ('Сбой AirTraffic','Final source not consumed')) and 'не подтвердил нужные объекты' not in str(error)
 
