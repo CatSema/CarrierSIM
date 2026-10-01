@@ -44,6 +44,8 @@ CONNECTION = 'USB'
 # AirTraffic at 170 s. Recovery starts over a fresh connection and restores Books from books.zip.
 NETWORK_TRANSFER_SECONDS = 300
 NETWORK_BOOKS_SECONDS = 90
+# The native AirTraffic host must finish one stage (both sync sessions and the pause) in this time.
+AIRTRAFFIC_SECONDS = 170
 
 
 def network_timeout(seconds):
@@ -305,7 +307,7 @@ async def purge_stale_books(afc, run):
             # Any other AFC failure (no space, lost connection) must not pass as "denied".
             if error.status != AFC_PERM_DENIED:
                 raise
-            removed[path] = 'запись запрещена: ' + str(error)
+            removed[path] = 'запись запрещена: ' + error_text(error)
             continue
         require(await afc.get_file_contents(path) == clean, 'Не удалось очистить ' + path)
         removed[path] = len(items) - len(data['Books'])
@@ -352,7 +354,7 @@ async def purge_outstanding(afc, run):
     try:
         rows = [r[0] or '' for r in read_outstanding(files)]
     except sqlite3.Error as error:
-        return 'не прочитана: ' + str(error)
+        return 'не прочитана: ' + error_text(error)
     mine = [x for x in rows if our_trace(x)]
     if not mine:
         return 0
@@ -383,13 +385,13 @@ async def clean_phone(device, run):
                     write_tree_zip(copy, tree)
                     require(read_tree_zip(copy) == tree, 'копия не совпала')
                 except Exception as error:
-                    report[name] = 'не удалён: локальная копия не сохранена: ' + str(error)
+                    report[name] = 'не удалён: локальная копия не сохранена: ' + error_text(error)
                     continue
             try:
                 await remove_tree(afc, name)
                 report[name] = 'удалён'
             except Exception as error:
-                report[name] = 'не удалён: ' + str(error)
+                report[name] = 'не удалён: ' + error_text(error)
         lists = await purge_stale_books(afc, run)
         if lists: report['списки Books'] = lists
         outstanding = await purge_outstanding(afc, run)
@@ -505,7 +507,7 @@ async def syslog_capture(device, path, keep, status=None, linger=1):
             raise
         except Exception as error:
             if status is not None:
-                status['log_error'] = type(error).__name__ + ': ' + str(error)
+                status['log_error'] = error_line(error)
             with contextlib.suppress(Exception):
                 with path.open('a', encoding='utf-8') as f: f.write('LOG ERROR: ' + repr(error) + '\n')
         finally:
@@ -618,7 +620,7 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
             require(await exists(afc, final_source) is None, 'Final source not consumed; operation unconfirmed')
             phase('placement-observed', complete=True, requires_recovery=False)
         except BaseException as error:
-            journal['operation_error'] = str(error)
+            journal['operation_error'] = error_text(error)
             save_json(run / 'journal.json', journal)
             raise
         finally:
@@ -631,11 +633,11 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
                     if other: journal['books_other_changes'] = other[:50]
                 except Exception as e:
                     journal['books_restored'] = False
-                    journal['books_restore_error'] = str(e)
+                    journal['books_restore_error'] = error_text(e)
                     save_json(run / 'journal.json', journal)
                     if journal.get('complete'):
                         raise RuntimeError('Каталог операторов записан и проверен, не удалось только вернуть '
-                                           'служебные файлы Books: ' + str(e)) from e
+                                           'служебные файлы Books: ' + error_text(e)) from e
                     raise
                 save_json(run / 'journal.json', journal)
     # Remote originals and staging identifiers are intentionally retained for recovery.
@@ -705,7 +707,7 @@ async def install_trigger(device, path, run):
             save_json(run / 'installation.json', status)
             await asyncio.sleep(8)
     except BaseException as error:
-        status['installation_error'] = type(error).__name__ + ': ' + str(error)
+        status['installation_error'] = error_line(error)
         raise
     finally:
         save_json(run / 'installation.json', status)
@@ -809,6 +811,26 @@ class AppleHost:
             self.objc.objc_autoreleasePoolPop(self.pool); self.pool = None
 
 
+def error_text(error):
+    # TimeoutError and pymobiledevice3's connection errors often carry no message;
+    # never print or store a bare "Ошибка:". Unknown empty errors fall back to the type name.
+    text = str(error).strip()
+    if text: return text
+    if isinstance(error, TimeoutError): return 'время ожидания истекло'
+    connection = (ConnectionError,)
+    with contextlib.suppress(Exception):  # a broken install must not hide the real error behind ImportError
+        from pymobiledevice3 import exceptions as errors
+        connection += (errors.ConnectionTerminatedError, errors.ConnectionFailedError)
+    if isinstance(error, connection): return 'связь с iPhone оборвалась'
+    return type(error).__name__
+
+
+def error_line(error):
+    # "Type: text" for journals and the final report, without "KeyError: KeyError".
+    text = error_text(error)
+    return type(error).__name__ + ('' if text == type(error).__name__ else ': ' + text)
+
+
 def framed(value):
     print('CARRIER_SWAP_JSON:' + json.dumps(value), flush=True)
 
@@ -834,7 +856,7 @@ def native_host(udid, assets, directories):
                 try:
                     name = host.decode(host.at.ATCFMessageGetName(msg))
                     try: body = json.dumps(host.decode(msg), ensure_ascii=False, default=str)[:4000]
-                    except Exception as e: body = 'не прочитано: ' + str(e)
+                    except Exception as e: body = 'не прочитано: ' + error_text(e)
                     framed({'event': 'message', 'name': name, 'body': body})
                     if name == wanted:
                         if name != 'AssetManifest': return True
@@ -893,11 +915,13 @@ async def host_session(udid, assets, callback, run):
         with (run/'host.stderr').open('wb') as f:
             while data := await proc.stderr.read(4096): f.write(data)
     task = asyncio.create_task(stderr())
-    paused = False; result = None
+    paused = False; result = None; heard = False
+    deadline = asyncio.timeout(AIRTRAFFIC_SECONDS)
     try:
         with (run/'host.jsonl').open('wb') as log:
-            async with asyncio.timeout(170):
+            async with deadline:
                 while line := await proc.stdout.readline():
+                    heard = True
                     log.write(line); log.flush()
                     if not line.startswith(b'CARRIER_SWAP_JSON:'): continue
                     row = json.loads(line[len(b'CARRIER_SWAP_JSON:'):])
@@ -909,6 +933,18 @@ async def host_session(udid, assets, callback, run):
                 code = await proc.wait()
         detail = (result or {}).get('error') or ('код ' + str(code))
         require(code == 0 and paused and result and result.get('ok'), 'Сбой AirTraffic: ' + str(detail))
+    except TimeoutError:
+        if not deadline.expired(): raise  # a timeout inside the pause (Books, AFC) keeps its own cause
+        if not heard and CONNECTION == 'Network':
+            # Seen on Wi-Fi: the host never reached atc, attempt after attempt. Without "Сбой AirTraffic"
+            # the error is not transient: the stage is rolled back once and no retry wastes minutes.
+            hint = (' Частая причина на macOS: терминалу не разрешена «Локальная сеть» (Системные настройки → '
+                    'Конфиденциальность и безопасность), в tmux, screen и SSH её не бывает.' if sys.platform == 'darwin' else '')
+            raise RuntimeError(f'AirTraffic не ответил по Wi-Fi за {AIRTRAFFIC_SECONDS} с.{hint} Подключите кабель, '
+                               'переключите связь на кабель (пункт 10) и повторите') from None
+        # "Сбой AirTraffic" keeps it transient: the usual rollback and retry follow.
+        raise RuntimeError('Сбой AirTraffic: ' + ('AirTraffic не ответил' if not heard else
+                           'синхронизация не завершилась') + f' за {AIRTRAFFIC_SECONDS} с') from None
     finally:
         if proc.returncode is None:
             proc.kill(); await proc.wait()
@@ -1842,7 +1878,7 @@ async def execute(args,assets):
         return 0
     except BaseException as error:
         if run:
-            save_json(run/'error.json',{'error':type(error).__name__+': '+str(error)})
+            save_json(run/'error.json',{'error':error_line(error)})
             # execute_with_retry rolls back any unfinished stage and reports the outcome.
             print('Операция остановлена. Журнал:',run,file=sys.stderr)
         raise
@@ -2056,7 +2092,7 @@ def save_environment(run):
 def print_diagnostics(error):
     rows = []
     try: rows += environment_info()
-    except Exception as e: rows.append(('Окружение', f'не собрано: {e}'))
+    except Exception as e: rows.append(('Окружение', f'не собрано: {error_text(e)}'))
     info = DIAG.get('info')
     if info:
         rows.append(('iPhone', f"{MODELS.get(info['ProductType'], {}).get('name', '?')} · {info['ProductType']} · "
@@ -2073,8 +2109,8 @@ def print_diagnostics(error):
     if run:
         rows.append(('Папка операции', str(run)))
         try: rows += run_details(run)
-        except Exception as e: rows.append(('Журналы', f'не прочитаны: {e}'))
-    rows.append(('Ошибка', f'{type(error).__name__}: {error}'))
+        except Exception as e: rows.append(('Журналы', f'не прочитаны: {error_text(e)}'))
+    rows.append(('Ошибка', error_line(error)))
     import traceback
     frames = [f for f in traceback.extract_tb(error.__traceback__) if f.filename.endswith(('carrier.py', 'launch.py'))]
     if frames:
@@ -2096,7 +2132,7 @@ def main():
             value=json.loads(sys.stdin.readline()) if sys.argv[2]=='check' else read_json(Path(sys.argv[2]))
             native_host(value.get('udid'),value.get('assets',[]),value.get('directories',[]))
             return 0
-        except Exception as e:framed({'ok':False,'error':str(e)});return 1
+        except Exception as e:framed({'ok':False,'error':error_text(e)});return 1
     parser=argparse.ArgumentParser(description='Профиль из bundle.yaml для SIM России и Беларуси; зарубежные — только по явному выбору. '
         'Без флагов: установить по IMSI на SIM, сообщённые iPhone. Без ограничений по модели iPhone и версии iOS; совместимость не гарантируется.',
         add_help=False)
@@ -2149,7 +2185,7 @@ def main():
     except Exception as error:
         # Recovery must not depend on the bundled triggers: they are only used for the final rescan.
         if not args.recover: raise
-        print(f'Предупреждение: assets.zip недоступен ({error}). Восстановление пройдёт без пересканирования.',flush=True)
+        print(f'Предупреждение: assets.zip недоступен ({error_text(error)}). Восстановление пройдёт без пересканирования.',flush=True)
         assets=None
     global APPLE_DIRS, CONNECTION
     if args.wifi: CONNECTION='Network'
@@ -2186,7 +2222,7 @@ def cli():
     except Exception as e:
         if not (len(sys.argv)>1 and sys.argv[1]=='--_host'):
             with contextlib.suppress(Exception):print_diagnostics(e)
-        print('Ошибка:',str(e),file=sys.stderr);sys.exit(1)
+        print('Ошибка:',error_text(e),file=sys.stderr);sys.exit(1)
 
 
 if __name__=='__main__':

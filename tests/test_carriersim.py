@@ -301,6 +301,56 @@ class RetryTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.args.udid, 'phone')
 
 
+class ErrorTextTest(unittest.IsolatedAsyncioTestCase):
+    def test_empty_exceptions_get_readable_text(self):
+        from pymobiledevice3.exceptions import ConnectionTerminatedError, ConnectionFailedError
+        self.assertEqual(carrier.error_text(TimeoutError()), 'время ожидания истекло')
+        self.assertEqual(carrier.error_text(ConnectionTerminatedError()), 'связь с iPhone оборвалась')
+        self.assertEqual(carrier.error_text(ConnectionFailedError()), 'связь с iPhone оборвалась')
+        self.assertEqual(carrier.error_text(RuntimeError('текст')), 'текст')
+        self.assertEqual(carrier.error_text(KeyError()), 'KeyError')
+        self.assertEqual(carrier.error_line(KeyError()), 'KeyError')
+        self.assertEqual(carrier.error_line(asyncio.CancelledError()), 'CancelledError')
+        self.assertEqual(carrier.error_line(TimeoutError()), 'TimeoutError: время ожидания истекло')
+        with patch.dict(sys.modules, {'pymobiledevice3': None}):  # broken install: still readable
+            self.assertEqual(carrier.error_text(TimeoutError()), 'время ожидания истекло')
+            self.assertEqual(carrier.error_text(ConnectionResetError()), 'связь с iPhone оборвалась')
+            self.assertEqual(carrier.error_text(KeyError()), 'KeyError')
+
+    async def silent_host(self, connection):
+        async def never(): await asyncio.Event().wait()
+        proc = SimpleNamespace(stdout=SimpleNamespace(readline=never), stderr=SimpleNamespace(read=AsyncMock(return_value=b'')),
+                               stdin=SimpleNamespace(), returncode=None, kill=lambda: None, wait=AsyncMock(return_value=-9))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(carrier.asyncio, 'create_subprocess_exec', AsyncMock(return_value=proc)), \
+                patch.object(carrier, 'AIRTRAFFIC_SECONDS', 0.05), patch.object(carrier, 'CONNECTION', connection), \
+                self.assertRaises(RuntimeError) as caught:
+            await carrier.host_session('phone', [], AsyncMock(), pathlib.Path(directory))
+        return caught.exception
+
+    async def test_silent_host_over_wifi_fails_fast_with_a_cable_hint(self):
+        error = await self.silent_host('Network')
+        self.assertIn('AirTraffic не ответил по Wi-Fi', str(error))
+        self.assertIn('Подключите кабель', str(error))
+        self.assertFalse(carrier.transient_error(error))
+
+    async def test_silent_host_over_usb_stays_transient(self):
+        error = await self.silent_host('USB')
+        self.assertIn('Сбой AirTraffic: AirTraffic не ответил', str(error))
+        self.assertTrue(carrier.transient_error(error))
+
+    async def test_timeout_inside_the_pause_keeps_its_own_cause(self):
+        lines = iter([b'CARRIER_SWAP_JSON:{"event": "before-final-asset"}\n'])
+        async def readline(): return next(lines)
+        proc = SimpleNamespace(stdout=SimpleNamespace(readline=readline), stderr=SimpleNamespace(read=AsyncMock(return_value=b'')),
+                               stdin=SimpleNamespace(), returncode=None, kill=lambda: None, wait=AsyncMock(return_value=-9))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(carrier.asyncio, 'create_subprocess_exec', AsyncMock(return_value=proc)), \
+                self.assertRaises(TimeoutError):
+            await carrier.host_session('phone', [], AsyncMock(side_effect=TimeoutError(60, 'Operation timed out')),
+                                       pathlib.Path(directory))
+
+
 class CatalogTest(unittest.TestCase):
     CATALOG = {'meta': {'ios': '27.0', 'deviceName': 'iPhone 17'},
                'bundles': [{'b': 'Vodafone_tr', 'country': 'Turkey', 'reg': '13191', 'ih': 'cellular', 'wroam': True,
