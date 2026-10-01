@@ -20,7 +20,10 @@ import time
 import zipfile
 from carriersim_version import VERSION
 
-ROOT = Path(__file__).resolve().parent
+# A PyInstaller build (CarrierSIM executable) keeps bundle.yaml, assets.zip and runs next to itself.
+FROZEN = getattr(sys, 'frozen', False)
+SELF = Path(sys.executable if FROZEN else __file__).resolve()
+ROOT = SELF.parent
 
 PARENT = '/var/mobile/Library/Carrier Bundles'
 TARGET = PARENT + '/iPhone'
@@ -878,7 +881,7 @@ def native_host(udid, assets, directories):
 
 
 def host_command():
-    return [sys.executable, str(Path(__file__).resolve()), '--_host']
+    return [sys.executable, '--carrier', '--_host'] if FROZEN else [sys.executable, str(SELF), '--_host']
 
 
 async def host_session(udid, assets, callback, run):
@@ -1877,7 +1880,7 @@ def environment_info():
     import platform
     from importlib.metadata import version, metadata, PackageNotFoundError
     rows = [('CarrierSIM', VERSION),
-            ('Сборка скрипта', digest((ROOT/'carrier.py').read_bytes())[:12]),
+            ('Сборка скрипта', digest(SELF.read_bytes())[:12]),
             ('Python', f"{sys.version.split()[0]} {platform.machine()} {'64' if sys.maxsize > 2**32 else '32'}-bit")]
     libs = []
     for name in ('pymobiledevice3', 'cryptography', 'pyimg4', 'pylzss', 'lzfse'):
@@ -2039,7 +2042,7 @@ class Tee:
 def start_session_log(runs):
     path = runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'session.log')
     log = path.open('a', encoding='utf-8', buffering=1)
-    log.write(f'CarrierSIM {VERSION} · сборка {digest((ROOT/"carrier.py").read_bytes())[:12]}\n')
+    log.write(f'CarrierSIM {VERSION} · сборка {digest(SELF.read_bytes())[:12]}\n')
     log.write(' '.join(['carrier.py'] + sys.argv[1:]) + '\n')
     sys.stdout, sys.stderr = Tee(sys.stdout, log), Tee(sys.stderr, log)
     DIAG['session_log'] = str(path)
@@ -2158,6 +2161,9 @@ def main():
     require(check.returncode==0 and frames and frames[-1].get('ok'),
             'Библиотеки Apple недоступны: '+str(frames[-1].get('error') if frames else check.stderr.strip()))
     if args.check:
+        # Every pymobiledevice3 module the phone steps use; a broken install or build fails here, not mid-run.
+        import pymobiledevice3.lockdown, pymobiledevice3.usbmux, pymobiledevice3.services.afc, \
+            pymobiledevice3.services.installation_proxy, pymobiledevice3.services.os_trace, pymobiledevice3.services.syslog
         for k,v in environment_info():print(f'{k}: {v}')
         print('Триггеры целы, библиотеки Apple доступны; пакеты будут взяты из системы iPhone. Подключений к телефону не было.');return 0
     args.runs=args.runs.resolve()
@@ -2173,7 +2179,7 @@ def main():
     with operation_lock(args.runs):return asyncio.run(execute_with_retry(args,assets)) or 0
 
 
-if __name__=='__main__':
+def cli():
     try:sys.exit(main())
     except KeyboardInterrupt:
         print('Прервано. Не удаляйте папку runs. Если запись уже началась, '+recover_hint()+'.',file=sys.stderr);sys.exit(130)
@@ -2181,3 +2187,7 @@ if __name__=='__main__':
         if not (len(sys.argv)>1 and sys.argv[1]=='--_host'):
             with contextlib.suppress(Exception):print_diagnostics(e)
         print('Ошибка:',str(e),file=sys.stderr);sys.exit(1)
+
+
+if __name__=='__main__':
+    cli()

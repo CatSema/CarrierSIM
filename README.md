@@ -26,6 +26,16 @@
 
 При первом запуске скрипт сам скачает нужные библиотеки в папку `.venv`. Это займёт пару минут.
 
+### Без Python: готовая сборка
+
+К релизу прикладываются архивы `CarrierSIM-vN-macOS-arm64.zip`, `CarrierSIM-vN-macOS-x86_64.zip` и `CarrierSIM-vN-Windows-x64.zip`. Python и библиотеки уже внутри. Их собирает GitHub Actions (`.github/workflows/standalone.yml`) из того же тега, происхождение подтверждено attestation: `gh attestation verify CarrierSIM-vN-….zip -R ios-bundles/CarrierSIM`.
+
+1. Распакуйте архив целиком. Рядом с `CarrierSIM` (`CarrierSIM.exe`) лежат `bundle.yaml`, `assets.zip` и README. `runs` появится там же.
+2. macOS: сборка не подписана Apple. Один раз снимите карантин со всей папки: `xattr -dr com.apple.quarantine ~/Downloads/CarrierSIM` (путь укажите свой, куда распаковали), потом запустите `CarrierSIM` двойным щелчком. Без этого macOS не даст открыть файл или его библиотеки.
+3. Windows: iTunes x64 с сайта Apple нужен так же, как и скрипту. Запустите `CarrierSIM.exe`.
+
+Меню и флаги те же, что у скрипта: `CarrierSIM --status`, `CarrierSIM --bundle Vodafone_ro --sims 1` и так далее. Сборка для macOS arm64 проверена без телефона (`--check`, меню). Сборки для Windows и Intel Mac на железе не запускались.
+
 ## Меню
 
 | Пункт | Что делает |
