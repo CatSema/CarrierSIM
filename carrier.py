@@ -1201,6 +1201,16 @@ def report_log(path, sims):
     return list(results.values())
 
 
+def slot_outcome(result, ok):
+    # One line per SIM after the rescan; the wording is what users paste into bug reports.
+    expected = (result['expected'] or '').removesuffix('.bundle')
+    selected = (result['selected'] or '').removesuffix('.bundle')
+    if ok: return (selected or 'штатный профиль') + ' — подпись принята'
+    if not selected: return 'в журнале пересканирования нет выбора пакета для этой SIM'
+    if expected and selected.lower() != expected.lower(): return f'iOS выбрала {selected} вместо {expected}'
+    return f'{selected} выбран, но подпись не принята'
+
+
 def read_json(path):
     return json.loads(path.read_text(encoding='utf-8'))
 
@@ -1681,8 +1691,7 @@ async def execute(args,assets):
         unconfirmed=False
         for s in result:
             ok=s['verified'] and (args.restore or (s['selected'] or '').lower()==s['expected'].lower());unconfirmed |= not ok
-            print(f"{SLOT_NAMES[s['slot']]} ({s['plmn']}): "+(s['selected']+' — подпись принята' if ok else
-                  'выбор нужного пакета не подтверждён; см. журнал'),flush=True)
+            print(f"{SLOT_NAMES[s['slot']]} ({s['plmn']}): "+slot_outcome(s,ok),flush=True)
         if args.restore:
             print(('Ссылка по IMSI выбранной SIM удалена, другая SIM не тронута.' if restore_imsis else
                    'Все ссылки по IMSI удалены.')+' Обычные ссылки операторов сохранены.',flush=True)
@@ -1700,8 +1709,8 @@ async def execute(args,assets):
         if missing:
             # AFC cannot read /System, so a missing bundle only shows up in the rescan log.
             # Never leave links to it: put back the catalog saved before this write.
-            print('iOS не выбрала '+', '.join(missing)+': такого пакета, видимо, нет в этой '
-                  'версии iOS или имя введено с ошибкой. Возвращаю прежние настройки…',flush=True)
+            print('iOS не выбрала '+', '.join(missing)+': пакета может не быть в этой версии iOS, имя может '
+                  'быть с ошибкой, или iOS отдаёт этой SIM другой пакет. Возвращаю прежние настройки…',flush=True)
             # The rescan trigger may have touched other parts of the catalog since the readback;
             # only this run's IMSI links must still be exactly as written.
             await transfer(device,run/'rollback',payload=original,
@@ -1714,7 +1723,13 @@ async def execute(args,assets):
                                          'rolled_back':True})
             print('Прежние настройки возвращены. Проверьте имя пакета (bundle.yaml или пункт 7) и повторите.',flush=True)
             return UNCONFIRMED
-        if unconfirmed:return UNCONFIRMED
+        if unconfirmed:
+            print(('Каталог записан, но журнал не подтвердил выбор. Включите авиарежим на 15 секунд и откройте '
+                   'пункт 2 (--status): в строке «сейчас» должен быть нужный профиль. Если там прежний, '
+                   'верните штатный пунктом 4 и пришлите автору журнал операции.') if installing else
+                  ('Журнал не подтвердил выбор штатного профиля. Включите авиарежим на 15 секунд и откройте '
+                   'пункт 2 (--status): в строке «сейчас» должен быть профиль оператора.'),flush=True)
+            return UNCONFIRMED
         print('Books: служебные файлы синхронизации возвращены в исходное состояние'+books_summary(run)+'.',flush=True)
         print('Готово. Включите авиарежим на 15 секунд и проверьте связь. Работа 5G не проверялась.')
         return 0
