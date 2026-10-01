@@ -138,6 +138,29 @@ class SimsTest(unittest.TestCase):
         self.rows[1].pop('InternationalMobileSubscriberIdentity')
         self.assertEqual(len(carrier.select_sims(self.rows, slots=('kOne',))), 1)
 
+    def test_default_profile_skips_foreign_sim_unless_named_or_picked(self):
+        foreign = dict(Slot='kTwo', MCC='262', MNC='01')  # no IMSI needed for a SIM left alone
+        config = {'default': 'Vodafone_hu.bundle'}
+        skipped = []
+        result = carrier.select_sims([self.rows[0], foreign], config, any_mcc=False, skipped=skipped)
+        self.assertEqual([s['slot'] for s in result], ['kOne'])
+        self.assertEqual(skipped, ['kTwo'])
+        foreign['InternationalMobileSubscriberIdentity'] = '262011234567890'
+        named = carrier.select_sims([foreign], dict(config, **{'26201': 'O2_Germany.bundle'}), any_mcc=False)
+        self.assertEqual(named[0]['bundle'], 'O2_Germany.bundle')
+        picked = carrier.select_sims([foreign], config, ('kTwo',), any_mcc=True)
+        self.assertEqual(picked[0]['bundle'], 'Vodafone_hu.bundle')
+        with self.assertRaises(RuntimeError):
+            carrier.select_sims([foreign], config, any_mcc=False, skipped=[])
+        status_skipped = []  # --status only reads: the plan still shows "не трогаю"
+        self.assertEqual(carrier.select_sims([foreign], config, any_mcc=False, skipped=status_skipped,
+                                             only_skipped_ok=True), [])
+        self.assertEqual(status_skipped, ['kTwo'])
+        self.assertEqual(carrier.bundle_for('25701', config), 'Vodafone_hu.bundle')
+        blank = dict(Slot='kOne', MCC='', MNC='')  # locked phone: not a foreign SIM, an error
+        with self.assertRaisesRegex(RuntimeError, 'разблокируйте'):
+            carrier.select_sims([blank], config, any_mcc=False, skipped=[])
+
     def test_plan_changes_only_selected_imsi_and_preserves_original(self):
         original = {'25001': ('l', b'existing'), 'Info.plist': ('f', b'data')}
         sims = carrier.select_sims(self.rows, slots=('kTwo',))
@@ -381,6 +404,261 @@ class ReportNoTtyTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('без терминала', saved)
 
 
+class LogStreamTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def entry(text, filename='/System/Library/Frameworks/CoreTelephony.framework/Support/CommCenter'):
+        return SimpleNamespace(message=text, label=None, filename=filename,
+                               timestamp=__import__('datetime').datetime(2026, 9, 30))
+
+    async def collect(self, plan, seconds=0.5, pids=None, on_entry=None):
+        # plan: one item per syslog() call — a list of texts (or (text, filename)), optionally ending in an exception.
+        # pids: one item per get_pid_list() call — True, False (no CommCenter) or an exception to raise.
+        plan = list(plan); pids = list(pids or []); seen = []; self.syslog_pids = []
+
+        test = self
+
+        class FakeTrace:
+            def __init__(self, device): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get_pid_list(self):
+                found = pids.pop(0) if pids else True
+                if isinstance(found, BaseException): raise found
+                return {'Payload': {'42': {'ProcessName': 'CommCenter'}} if found else {}}
+            async def syslog(self, pid):
+                test.syslog_pids.append(pid)
+                step = plan.pop(0) if plan else []
+                for item in step:
+                    if isinstance(item, BaseException): raise item
+                    yield LogStreamTest.entry(*item) if isinstance(item, tuple) else LogStreamTest.entry(item)
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('pymobiledevice3.services.os_trace.OsTraceService', FakeTrace), \
+                patch.object(carrier.asyncio, 'sleep', AsyncMock()), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            await carrier.commcenter_stream(None, seconds, pathlib.Path(directory, 'log'),
+                                            on_entry or (lambda e, msg: seen.append(msg)))
+        return seen, output.getvalue()
+
+    async def test_drop_then_reconnect_counts_one_reconnect(self):
+        from pymobiledevice3.exceptions import ConnectionTerminatedError
+        seen, out = await self.collect([['before', ConnectionTerminatedError()], ['after']])
+        self.assertEqual(seen, ['before', 'after'])
+        self.assertIn('переподключений: 1', out)
+
+    async def test_socket_timeout_is_a_drop_not_the_end(self):
+        seen, out = await self.collect([['before', TimeoutError(60, 'Operation timed out')], ['after']])
+        self.assertEqual(seen, ['before', 'after'])
+
+    async def test_missing_commcenter_on_reconnect_is_retried(self):
+        from pymobiledevice3.exceptions import ConnectionTerminatedError
+        # pids: initial lookup, then "not running yet", then found again.
+        seen, out = await self.collect([['before', ConnectionTerminatedError()], ['after']], pids=[True, False, True])
+        self.assertEqual(seen, ['before', 'after'])
+
+    async def test_process_list_refused_over_wifi_streams_all_and_keeps_commcenter(self):
+        from pymobiledevice3.exceptions import ConnectionTerminatedError
+        seen, out = await self.collect([['before', ('noise', '/usr/libexec/locationd'), ConnectionTerminatedError()],
+                                        ['after']], pids=[ConnectionTerminatedError()])
+        self.assertEqual(seen, ['before', 'after'])
+        # The refused list is not asked for again on reconnect: both streams are unfiltered.
+        self.assertEqual(self.syslog_pids, [carrier.ALL_PROCESSES] * 2)
+        self.assertIn('переподключений: 1', out)
+
+    async def test_refused_lookup_on_reconnect_is_a_drop_not_the_wifi_fallback(self):
+        from pymobiledevice3.exceptions import ConnectionTerminatedError
+        # Cable, airplane mode: the relay is still down when the pid is looked up again.
+        seen, out = await self.collect([['before', ConnectionTerminatedError()], ['after']],
+                                       pids=[True, ConnectionTerminatedError(), True])
+        self.assertEqual(seen, ['before', 'after'])
+        self.assertEqual(self.syslog_pids, [42, 42])
+        self.assertNotIn('список процессов', out)
+
+    async def test_fatal_error_is_not_swallowed(self):
+        from pymobiledevice3.exceptions import NotPairedError
+        with self.assertRaises(NotPairedError):
+            await self.collect([['before', NotPairedError()]])
+
+    async def test_log_that_never_came_is_an_error(self):
+        from pymobiledevice3.exceptions import ConnectionFailedError
+        with patch.object(carrier, 'LOG_RECONNECT_SECONDS', 0.05), self.assertRaisesRegex(RuntimeError, 'недоступен'):
+            await self.collect([[ConnectionFailedError()]] * 10000, seconds=5)
+
+    async def test_log_that_never_returns_keeps_what_was_collected(self):
+        from pymobiledevice3.exceptions import ConnectionFailedError
+        with patch.object(carrier, 'LOG_RECONNECT_SECONDS', 0.05):
+            seen, output = await self.collect([['before', ConnectionFailedError()]] + [[ConnectionFailedError()]] * 10000,
+                                              seconds=5)
+        self.assertEqual(seen, ['before'])
+        self.assertIn('Журнал не вернулся за 0.05 с', output)
+
+    async def test_hung_reconnect_is_bounded_and_keeps_what_was_collected(self):
+        from pymobiledevice3.exceptions import ConnectionFailedError
+        with patch.object(carrier, 'LOG_RECONNECT_SECONDS', 0.05):
+            seen, output = await self.collect([['before', ConnectionFailedError()], []], seconds=30)
+        self.assertEqual(seen, ['before'])
+        self.assertIn('Журнал не вернулся за 0.05 с', output)
+
+    async def test_silent_log_is_an_error_not_an_empty_report(self):
+        with self.assertRaisesRegex(RuntimeError, 'не пришёл'):
+            await self.collect([[]], seconds=0.1)
+
+    async def test_local_write_failure_is_not_a_drop(self):
+        def broken(e, msg): raise OSError(28, 'No space left on device')
+        with self.assertRaises(OSError):
+            await self.collect([['before']], on_entry=broken)
+
+
+class ErrorTextTest(unittest.IsolatedAsyncioTestCase):
+    def test_empty_exceptions_get_readable_text(self):
+        from pymobiledevice3.exceptions import ConnectionTerminatedError, ConnectionFailedError
+        self.assertEqual(carrier.error_text(TimeoutError()), 'время ожидания истекло')
+        self.assertEqual(carrier.error_text(ConnectionTerminatedError()), 'связь с iPhone оборвалась')
+        self.assertEqual(carrier.error_text(ConnectionFailedError()), 'связь с iPhone оборвалась')
+        self.assertEqual(carrier.error_text(RuntimeError('текст')), 'текст')
+        self.assertEqual(carrier.error_text(KeyError()), 'KeyError')
+        self.assertEqual(carrier.error_line(KeyError()), 'KeyError')
+        self.assertEqual(carrier.error_line(asyncio.CancelledError()), 'CancelledError')
+        self.assertEqual(carrier.error_line(TimeoutError()), 'TimeoutError: время ожидания истекло')
+        with patch.dict(sys.modules, {'pymobiledevice3': None}):  # broken install: still readable
+            self.assertEqual(carrier.error_text(TimeoutError()), 'время ожидания истекло')
+            self.assertEqual(carrier.error_text(ConnectionResetError()), 'связь с iPhone оборвалась')
+            self.assertEqual(carrier.error_text(KeyError()), 'KeyError')
+
+    async def silent_host(self, connection):
+        async def never(): await asyncio.Event().wait()
+        proc = SimpleNamespace(stdout=SimpleNamespace(readline=never), stderr=SimpleNamespace(read=AsyncMock(return_value=b'')),
+                               stdin=SimpleNamespace(), returncode=None, kill=lambda: None, wait=AsyncMock(return_value=-9))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(carrier.asyncio, 'create_subprocess_exec', AsyncMock(return_value=proc)), \
+                patch.object(carrier, 'AIRTRAFFIC_SECONDS', 0.05), patch.object(carrier, 'CONNECTION', connection), \
+                self.assertRaises(RuntimeError) as caught:
+            await carrier.host_session('phone', [], AsyncMock(), pathlib.Path(directory))
+        return caught.exception
+
+    async def test_silent_host_over_wifi_fails_fast_with_a_cable_hint(self):
+        error = await self.silent_host('Network')
+        self.assertIn('AirTraffic не ответил по Wi-Fi', str(error))
+        self.assertIn('Подключите кабель', str(error))
+        self.assertFalse(carrier.transient_error(error))
+
+    async def test_silent_host_over_usb_stays_transient(self):
+        error = await self.silent_host('USB')
+        self.assertIn('Сбой AirTraffic: AirTraffic не ответил', str(error))
+        self.assertTrue(carrier.transient_error(error))
+
+    async def test_timeout_inside_the_pause_keeps_its_own_cause(self):
+        lines = iter([b'CARRIER_SWAP_JSON:{"event": "before-final-asset"}\n'])
+        async def readline(): return next(lines)
+        proc = SimpleNamespace(stdout=SimpleNamespace(readline=readline), stderr=SimpleNamespace(read=AsyncMock(return_value=b'')),
+                               stdin=SimpleNamespace(), returncode=None, kill=lambda: None, wait=AsyncMock(return_value=-9))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(carrier.asyncio, 'create_subprocess_exec', AsyncMock(return_value=proc)), \
+                self.assertRaises(TimeoutError):
+            await carrier.host_session('phone', [], AsyncMock(side_effect=TimeoutError(60, 'Operation timed out')),
+                                       pathlib.Path(directory))
+
+
+class CatalogTest(unittest.TestCase):
+    CATALOG = {'meta': {'ios': '27.0', 'deviceName': 'iPhone 17'},
+               'bundles': [{'b': 'Vodafone_tr', 'country': 'Turkey', 'reg': '13191', 'ih': 'cellular', 'wroam': True,
+                            'wn': 'vodafone TR Wi-Fi', 'lte': '4G', 'vs': False, 'evs': True, 'xcap': True, 'vvm': 'none'},
+                           {'b': 'Vodafone_ro', 'reg': '+447786205094', 'ih': 'ims', 'wroam': False},
+                           {'b': 'Exit_zero', 'reg': '00447786205094'}]}
+
+    def load(self):
+        with tempfile.TemporaryDirectory() as runs:
+            pathlib.Path(runs, 'bundles.json').write_text(json.dumps(self.CATALOG), encoding='utf-8')
+            with patch('urllib.request.urlopen', side_effect=AssertionError('fresh cache must not be refetched')):
+                return carrier.load_catalog(runs)
+
+    def test_passport_from_cache_warns_about_short_imessage_number(self):
+        catalog = self.load()
+        text = '\n'.join(carrier.passport_lines('Vodafone_tr.bundle', catalog))
+        self.assertIn('местный номер 13191', text)
+        self.assertIn('в роуминге — да', text)
+        self.assertIn('приоритет дома — сотовая', text)
+        self.assertIn('международный номер', '\n'.join(carrier.passport_lines('Vodafone_ro', catalog)))
+        self.assertIn('Похожие: Vodafone_tr', carrier.passport_lines('Vodafon_tr', catalog)[0])
+        self.assertIn('международный номер', '\n'.join(carrier.passport_lines('Exit_zero', catalog)))
+
+    def test_case_only_mismatch_is_an_error_and_missing_catalog_is_silent(self):
+        catalog = self.load()
+        self.assertIn('Vodafone_tr', carrier.catalog_name_error('vodafone_TR.bundle', catalog))
+        self.assertIsNone(carrier.catalog_name_error('Vodafone_tr.bundle', catalog))
+        self.assertFalse(carrier.catalog_name_error('Unknown_xx', catalog))
+        self.assertIsNone(carrier.catalog_name_error('vodafone_tr', None))
+        self.assertEqual(carrier.passport_lines('Vodafone_tr', None), [])
+        with tempfile.TemporaryDirectory() as runs, \
+                patch('urllib.request.urlopen', side_effect=OSError('offline')):
+            self.assertIsNone(carrier.load_catalog(runs))
+
+    def test_downloaded_table_is_cached_atomically(self):
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(self.CATALOG).encode()
+        with tempfile.TemporaryDirectory() as runs, patch('urllib.request.urlopen', return_value=response):
+            self.assertIsNotNone(carrier.load_catalog(runs))
+            self.assertEqual([p.name for p in pathlib.Path(runs).iterdir()], ['bundles.json'])
+
+    INVALID_CATALOGS = (
+        None, [], {'meta': None, 'bundles': [{'b': 'Vodafone_tr'}]},
+        {'meta': [], 'bundles': []}, {'bundles': None}, {'bundles': {}},
+        {'bundles': [None]}, {'bundles': [{'b': 123}]}, {'bundles': [{'b': True}]},
+        {'bundles': [{'b': None}]}, {'bundles': [{'b': ''}]}, {'bundles': [{}]},
+        {'bundles': [{'b': 'Vodafone_tr', 'ih': []}]},
+        {'bundles': [{'b': 'Vodafone_tr', 'ih': {}}]},
+    )
+
+    def test_wrong_json_types_skip_passport_without_creating_cache(self):
+        for catalog in self.INVALID_CATALOGS:
+            with self.subTest(catalog=catalog), tempfile.TemporaryDirectory() as runs:
+                response = unittest.mock.MagicMock()
+                response.__enter__.return_value.read.return_value = json.dumps(catalog).encode()
+                with patch('urllib.request.urlopen', return_value=response):
+                    loaded = carrier.load_catalog(runs)
+                self.assertIsNone(loaded)
+                self.assertIsNone(carrier.catalog_name_error('Vodafone_tr.bundle', loaded))
+                self.assertEqual(carrier.passport_lines('Vodafone_tr.bundle', loaded), [])
+                self.assertEqual(list(pathlib.Path(runs).iterdir()), [])
+
+    def test_invalid_download_preserves_and_uses_stale_cache(self):
+        import os
+        for catalog in self.INVALID_CATALOGS:
+            with self.subTest(catalog=catalog), tempfile.TemporaryDirectory() as runs:
+                cache = pathlib.Path(runs, 'bundles.json')
+                original = json.dumps(self.CATALOG).encode()
+                cache.write_bytes(original)
+                os.utime(cache, (0, 0))
+                response = unittest.mock.MagicMock()
+                response.__enter__.return_value.read.return_value = json.dumps(catalog).encode()
+                with patch('urllib.request.urlopen', return_value=response) as download:
+                    loaded = carrier.load_catalog(runs)
+                download.assert_called_once()
+                self.assertEqual(cache.read_bytes(), original)
+                self.assertEqual([p.name for p in pathlib.Path(runs).iterdir()], ['bundles.json'])
+                self.assertIn('местный номер 13191', '\n'.join(carrier.passport_lines('Vodafone_tr', loaded)))
+
+    def test_wrong_types_in_existing_cache_are_ignored(self):
+        for catalog in self.INVALID_CATALOGS:
+            with self.subTest(catalog=catalog), tempfile.TemporaryDirectory() as runs:
+                pathlib.Path(runs, 'bundles.json').write_text(json.dumps(catalog), encoding='utf-8')
+                with patch('urllib.request.urlopen', side_effect=AssertionError('fresh cache')) as download:
+                    loaded = carrier.load_catalog(runs)
+                download.assert_not_called()
+                self.assertIsNone(loaded)
+                self.assertEqual(carrier.passport_lines('Vodafone_tr', loaded), [])
+
+
+class OutcomeTest(unittest.TestCase):
+    def test_rescan_outcome_names_what_ios_chose(self):
+        r = lambda selected, verified=True: {'expected': 'Vodafone_tr.bundle', 'selected': selected, 'verified': verified}
+        self.assertEqual(carrier.slot_outcome(r('Vodafone_tr.bundle'), True), 'Vodafone_tr — подпись принята')
+        self.assertEqual(carrier.slot_outcome(r('MTS_ru.bundle'), False), 'iOS выбрала MTS_ru вместо Vodafone_tr')
+        self.assertIn('нет выбора пакета', carrier.slot_outcome(r(None, False), False))
+        self.assertIn('подпись не принята', carrier.slot_outcome(r('Vodafone_tr.bundle', False), False))
+
+
 class VersionTest(unittest.TestCase):
     def test_cli_version_and_help_work_without_apple_services(self):
         for flag, expected in (('--version', f'CarrierSIM {VERSION}'), ('--help', '--recover')):
@@ -393,6 +671,34 @@ class VersionTest(unittest.TestCase):
         with patch('builtins.input', return_value='0'), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertIsNone(launch.menu())
         self.assertIn(f'CarrierSIM {VERSION}', output.getvalue())
+
+    def test_other_profile_shows_plan_and_writes_only_after_yes(self):
+        for answer, runs in (('', 2), ('д', 2), ('н', 1)):
+            # menu: 7, bundle name, SIM 2, then the confirmation, "press Enter", and 0 to quit.
+            inputs = iter(['7', 'Vodafone_tr', '2', answer, '', '0'])
+            with self.subTest(answer=answer), patch('builtins.input', lambda *_: next(inputs)), \
+                    patch.object(launch, 'check_writable'), patch.object(launch, 'python_environment'), \
+                    patch.object(launch, 'run_carrier', return_value=0) as run, patch.object(sys, 'argv', ['launch.py']), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(launch.main(), 0)
+            calls = [c.args[1] for c in run.call_args_list]
+            self.assertEqual(len(calls), runs)
+            self.assertEqual(calls[0], ['--bundle', 'Vodafone_tr', '--sims', '2', '--status'])
+            if runs == 2: self.assertEqual(calls[1], ['--bundle', 'Vodafone_tr', '--sims', '2'])
+
+    def test_other_profile_does_not_ask_when_the_plan_writes_nothing(self):
+        # menu: 7, bundle name, SIM 2, "press Enter", and 0 to quit — no confirmation question.
+        inputs = iter(['7', 'Vodafone_tr', '2', '', '0'])
+        with patch('builtins.input', lambda *_: next(inputs)), \
+                patch.object(launch, 'check_writable'), patch.object(launch, 'python_environment'), \
+                patch.object(launch, 'run_carrier', return_value=launch.NOTHING_TO_WRITE) as run, \
+                patch.object(sys, 'argv', ['launch.py']), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(launch.main(), 0)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.kwargs['env']['CARRIERSIM_PLAN'], '1')
+        self.assertIn('Записывать нечего', output.getvalue())
+        self.assertNotIn('Действие не завершено', output.getvalue())
+        self.assertEqual(launch.NOTHING_TO_WRITE, carrier.NOTHING_TO_WRITE)
 
     def test_log_environment_and_error_report_identify_version(self):
         with tempfile.TemporaryDirectory() as directory:
